@@ -78,6 +78,8 @@ Every message reaches the model with a header saying how it arrived (`agent.py: 
 | internal | (timeline only) | its own initiative checks; camera descriptions are context, not messages |
 
 Tools should identify themselves over the WebSocket: `{"type": "turn", "text": "...", "source": "developer", "sender": "Claude Code"}`.
+From the terminal, `project-scripts/send.sh --from "Claude Code" "message"` does exactly that and prints Housemate's reply
+(`--camera` attaches the current frame, `--speak` also plays it on open pages, `--timings` prints latency).
 
 Small models copy their own earlier replies, so wrong answers in the saved chat history get repeated. If it keeps
 insisting on something false, delete those rows from the `messages` table in `data/laptopai.db`.

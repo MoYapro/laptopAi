@@ -179,11 +179,18 @@ class Agent:
         present = self.presence.present()
         if present:
             lines.append("People you can see right now:")
+            unknown_count = sum(t.person_id is None for t in present)
             for t in present:
                 if t.person_id is None:
-                    lines.append("- someone you don't know yet (you could ask their name)")
+                    hint = (
+                        "if they tell you their name, you will remember their face"
+                        if unknown_count == 1
+                        else "several unknown faces are in view, so a name can't be linked to a face right now"
+                    )
+                    lines.append(f"- an unknown face, someone you don't know yet ({hint})")
                     continue
-                visit = f"in view for {fmt_dur(now - t.first_seen)}"
+                samples = self.presence.gallery.count(t.person_id)
+                visit = f"recognized by face, match {t.sim:.2f}, {samples} face samples; in view for {fmt_dur(now - t.first_seen)}"
                 if t.prev_seen:
                     visit += f", before that last seen {ago(t.prev_seen)}"
                 else:
