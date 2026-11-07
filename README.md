@@ -7,7 +7,7 @@ Prototyped on the desktop, deployed to an old XPS laptop.
 browser (localhost:8080)                app container (CPU)                                   llm container (GPU)
   chat / hold-to-talk  ───────────────► faster-whisper (STT) ──► agent ── reply ─────────►  Ollama (qwen3.5:4b)
   timeline, people, camera ◄──────────  perception loop (1/s):                              ▲
-  audio playback ◄── WAV per sentence ─   faces (YuNet + SFace) ── arrive/leave events      │
+  audio playback ◄── WAV per sentence ─   faces (YuNet + ArcFace) ── arrive/leave events    │
                                           scene change ── keyframe + description ──────────┤
                                         agent: initiative decision ────────────────────────┤
                                                memory extraction after each reply ─────────┘
@@ -27,6 +27,11 @@ browser (localhost:8080)                app container (CPU)                     
   known person and bring up what it remembers, ask a stranger's name, comment on what it sees). Hard limits in code:
   only when a face is in view, not during a conversation, cooldown, max per hour.
   **Quiet mode** (on by default) still runs the decision but only logs what it *would* have said.
+- **Curiosity**: every 5 minutes (if new things happened) it reflects on recent scenes, stores lasting
+  observations ("A cat lives here.") and writes down questions ("What's the cat's name?"), shown under
+  *Wondering about*. When someone is in view and it's been quiet for 5 minutes, it may ask one. Answers are picked up
+  from the conversation; an answer is only accepted if its content actually appears in what the person said.
+  Each question is asked at most twice, at least 6 h apart.
 - **Memory**: after each reply, a background step extracts durable facts ("Tom is converting his old XPS…") and names.
   Saying "I'm Anna" while exactly one unknown face is in view links the name to that face; or name a face on the page.
   Chat history survives restarts (last 6 h are sent along; older context comes from memory).
@@ -84,11 +89,31 @@ insisting on something false, delete those rows from the `messages` table in `da
 | `SCENE_CHANGE_THRESHOLD` | 12 | mean pixel difference (0–255) vs the last keyframe that counts as a change |
 | `SCENE_MIN_INTERVAL_S` / `SCENE_MAX_INTERVAL_S` | 15 / 120 | min gap between descriptions / re-describe this often while people are present |
 | `SNAPSHOT_RETENTION_DAYS` | 7 | snapshot folders older than this are deleted |
-| `FACE_MATCH_THRESHOLD` | 0.38 | SFace cosine similarity for "same person" (raise if it confuses people) |
+| `FACE_MATCH_THRESHOLD` | 0.30 | ArcFace cosine similarity for "same person" (raise if it confuses people) |
+| `FACE_MATCH_MARGIN` | 0.08 | the best person must beat the second best by this much |
+| `FACE_ENROLL_MIN_SIZE_PX` / `FACE_ENROLL_MAX_YAW` / `FACE_ENROLL_MIN_SHARPNESS` | 80 / 0.25 / 40 | quality bar for enrolling and learning |
 | `PERSON_LEFT_AFTER_S` | 30 | unseen this long → "left" |
 | `INITIATIVE_COOLDOWN_S` / `INITIATIVE_MAX_PER_HOUR` | 120 / 6 | limits for unprompted remarks |
 | `GREET_AFTER_ABSENCE_S` | 1800 | arrivals after this long may bypass the cooldown |
 | `QUIET_DEFAULT` | true | quiet mode until switched off on the page |
+| `REFLECT_INTERVAL_S` | 300 | how often recent scenes are turned into observations and questions |
+| `CURIOSITY_IDLE_S` | 300 | quiet this long with someone in view → it may ask one of its questions |
+| `QUESTION_REASK_S` / `QUESTION_MAX_ASKS` | 21600 / 2 | don't re-ask a question sooner / more often than this |
+
+## Face recognition
+
+Works like a face-login enrollment, without liveness detection (that needs an IR/3D camera; a photo of someone
+would be recognized as them, which is fine for a home assistant but not for security):
+
+- YuNet finds faces and 5 landmarks; each face is aligned to ArcFace's 112×112 template.
+- ArcFace `w600k_r50` (InsightFace) turns it into a 512-d embedding. ~50 ms per face on 2 CPU threads.
+- Enrollment and continuous learning only use good views: ≥ 80 px, sharp, roughly frontal, confident detection.
+- A match needs similarity ≥ `FACE_MATCH_THRESHOLD` and a margin over the second-best person, and the presence
+  tracker needs 2 consecutive frames (4 for strangers) before announcing anyone.
+- Measured on the desktop webcam: same person median 0.62, different people ≤ 0.03; after enrolling 5 good views,
+  10/10 other views of the same person were recognized.
+- Embeddings are tagged with their model; switching models means re-enrolling (name the person once on the page).
+- InsightFace's pretrained models are licensed for non-commercial use only.
 
 ## Privacy
 

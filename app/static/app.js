@@ -15,8 +15,9 @@ for (const el of [camToggle, speakToggle]) {
 
 const KIND_LABELS = {
   system_start: "start", system_stop: "shutdown", unclean_shutdown: "crash",
-  scene: "sees", person_arrived: "arrived", person_left: "left", person_named: "learned",
-  initiative: "initiative", decision: "decided", memory: "memory", setting: "setting",
+  scene: "sees", person_arrived: "arrived", person_left: "left", person_named: "name",
+  curious: "wondering", learned: "learned",
+  initiative: "said", initiative_quiet: "would say", decision: "decided", memory: "memory", setting: "setting",
 };
 
 function setState(s) {
@@ -176,6 +177,27 @@ function renderPeople() {
 }
 setInterval(renderPeople, 30000);
 
+// ---------------------------------------------------------------- open questions
+function renderQuestions(qs) {
+  const ul = $("questions");
+  ul.innerHTML = "";
+  if (!qs.length) {
+    ul.innerHTML = '<li class="empty">nothing yet</li>';
+    return;
+  }
+  for (const q of qs) {
+    const li = document.createElement("li");
+    li.textContent = q.text;
+    if (q.asked) {
+      const s = document.createElement("span");
+      s.className = "asked";
+      s.textContent = q.asked === 1 ? "asked once" : `asked ${q.asked}×`;
+      li.appendChild(s);
+    }
+    ul.appendChild(li);
+  }
+}
+
 // ---------------------------------------------------------------- audio out
 const audioQueue = [];
 let playing = false;
@@ -212,6 +234,7 @@ function connect() {
         people = m.people;
         renderPeople();
         quietToggle.checked = m.quiet;
+        renderQuestions(m.questions || []);
         $("model").textContent = m.model;
         break;
       case "state":
@@ -250,6 +273,9 @@ function connect() {
       case "presence":
         people = m.people;
         renderPeople();
+        break;
+      case "questions":
+        renderQuestions(m.questions);
         break;
       case "settings":
         quietToggle.checked = m.quiet;

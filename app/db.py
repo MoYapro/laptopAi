@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+-- things the AI wants to find out about its surroundings and the people in them
+CREATE TABLE IF NOT EXISTS questions (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',  -- open | answered | dropped
+    asked_count INTEGER NOT NULL DEFAULT 0, last_asked REAL,
+    answer TEXT, answered_ts REAL
+);
 """
 
 
@@ -52,6 +60,14 @@ class DB:
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(messages)")}
             if "sender" not in cols:
                 self._conn.execute("ALTER TABLE messages ADD COLUMN sender TEXT")
+            # embeddings from different face models can't be compared; tag each with its model
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(face_embeddings)")}
+            if "model" not in cols:
+                self._conn.execute("ALTER TABLE face_embeddings ADD COLUMN model TEXT NOT NULL DEFAULT 'sface'")
+            # quiet-mode initiatives used to share the "initiative" kind (and so ate into the hourly cap)
+            self._conn.execute(
+                "UPDATE events SET kind = 'initiative_quiet' WHERE kind = 'initiative' AND data LIKE '%\"quiet\": true%'"
+            )
 
     def _q(self, sql: str, args=()) -> list[sqlite3.Row]:
         with self._lock:
@@ -146,17 +162,20 @@ class DB:
         pid = self._insert("INSERT INTO people (name, created) VALUES (?, ?)", (name, time.time()))
         return self.person(pid)
 
+    def people(self) -> list[dict]:
+        return [dict(r) for r in self._q("SELECT * FROM people ORDER BY name")]
+
     def touch_person(self, pid: int, ts: float) -> None:
         self._q("UPDATE people SET last_seen = ? WHERE id = ?", (ts, pid))
 
-    def add_embedding(self, pid: int, vec: np.ndarray) -> None:
+    def add_embedding(self, pid: int, vec: np.ndarray, model: str) -> None:
         self._insert(
-            "INSERT INTO face_embeddings (person_id, ts, vec) VALUES (?, ?, ?)",
-            (pid, time.time(), vec.astype(np.float32).tobytes()),
+            "INSERT INTO face_embeddings (person_id, ts, vec, model) VALUES (?, ?, ?, ?)",
+            (pid, time.time(), vec.astype(np.float32).tobytes(), model),
         )
 
-    def embeddings(self) -> list[tuple[int, np.ndarray]]:
-        rows = self._q("SELECT person_id, vec FROM face_embeddings")
+    def embeddings(self, model: str) -> list[tuple[int, np.ndarray]]:
+        rows = self._q("SELECT person_id, vec FROM face_embeddings WHERE model = ?", (model,))
         return [(r["person_id"], np.frombuffer(r["vec"], dtype=np.float32)) for r in rows]
 
     # ----------------------------------------------------------- memories
@@ -177,6 +196,36 @@ class DB:
             "SELECT ts, text FROM memories WHERE person_id IS ? ORDER BY ts DESC LIMIT ?", (pid, limit)
         )
         return [dict(r) for r in reversed(rows)]
+
+    # ---------------------------------------------------------- questions
+
+    def add_question(self, text: str) -> dict:
+        ts = time.time()
+        qid = self._insert("INSERT INTO questions (ts, text) VALUES (?, ?)", (ts, text.strip()))
+        return {"id": qid, "ts": ts, "text": text.strip(), "asked_count": 0, "last_asked": None}
+
+    def open_questions(self, limit: int = 50) -> list[dict]:
+        rows = self._q("SELECT * FROM questions WHERE status = 'open' ORDER BY ts DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows]
+
+    def question(self, qid: int) -> dict | None:
+        rows = self._q("SELECT * FROM questions WHERE id = ?", (qid,))
+        return dict(rows[0]) if rows else None
+
+    def all_questions(self, limit: int) -> list[dict]:
+        rows = self._q("SELECT * FROM questions ORDER BY ts DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows]
+
+    def mark_asked(self, qid: int) -> None:
+        self._q(
+            "UPDATE questions SET asked_count = asked_count + 1, last_asked = ? WHERE id = ?", (time.time(), qid)
+        )
+
+    def set_question_status(self, qid: int, status: str, answer: str | None = None) -> None:
+        self._q(
+            "UPDATE questions SET status = ?, answer = ?, answered_ts = ? WHERE id = ?",
+            (status, answer, time.time() if answer else None, qid),
+        )
 
     # ----------------------------------------------------------- settings
 

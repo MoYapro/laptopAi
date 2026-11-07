@@ -41,8 +41,17 @@ SCENE_CHANGE_THRESHOLD = _float("SCENE_CHANGE_THRESHOLD", 12.0)  # mean abs pixe
 SCENE_MIN_INTERVAL_S = _float("SCENE_MIN_INTERVAL_S", 15)
 SCENE_MAX_INTERVAL_S = _float("SCENE_MAX_INTERVAL_S", 120)  # re-describe at least this often while people are present
 SNAPSHOT_RETENTION_DAYS = _float("SNAPSHOT_RETENTION_DAYS", 7)
-FACE_MATCH_THRESHOLD = _float("FACE_MATCH_THRESHOLD", 0.38)  # SFace cosine; OpenCV suggests 0.363
-FACE_MIN_SIZE_PX = _float("FACE_MIN_SIZE_PX", 40)
+FACE_MODEL = "arcface_w600k_r50"  # stored with each embedding; embeddings of other models are ignored
+# ArcFace cosine. Measured on this camera: same person median 0.62 (worst poses ~0.36 after enrollment),
+# different people <= 0.03. Lookalike relatives can reach 0.3-0.4; the margin rule below guards that case.
+FACE_MATCH_THRESHOLD = _float("FACE_MATCH_THRESHOLD", 0.30)
+FACE_MATCH_MARGIN = _float("FACE_MATCH_MARGIN", 0.08)  # best person must beat the second best by this much
+FACE_MIN_SIZE_PX = _float("FACE_MIN_SIZE_PX", 40)  # smaller faces are detected but not recognized
+# Enrollment / learning only from good views (like a login enrollment): big, sharp, roughly frontal.
+FACE_ENROLL_MIN_SIZE_PX = _float("FACE_ENROLL_MIN_SIZE_PX", 80)
+FACE_ENROLL_MIN_SHARPNESS = _float("FACE_ENROLL_MIN_SHARPNESS", 40)  # Laplacian variance of the aligned crop
+FACE_ENROLL_MAX_YAW = _float("FACE_ENROLL_MAX_YAW", 0.25)  # nose offset from the eye midpoint / eye distance
+FACE_RECOGNITION_THREADS = int(_float("FACE_RECOGNITION_THREADS", 2))
 PERSON_LEFT_AFTER_S = _float("PERSON_LEFT_AFTER_S", 30)
 
 REPLY_TEMPERATURE = _float("REPLY_TEMPERATURE", 0.6)
@@ -53,5 +62,12 @@ INITIATIVE_COOLDOWN_S = _float("INITIATIVE_COOLDOWN_S", 120)
 INITIATIVE_MAX_PER_HOUR = int(_float("INITIATIVE_MAX_PER_HOUR", 6))
 GREET_AFTER_ABSENCE_S = _float("GREET_AFTER_ABSENCE_S", 1800)  # arrivals after this long bypass the cooldown
 CONVERSATION_ACTIVE_S = _float("CONVERSATION_ACTIVE_S", 45)  # no unprompted remarks while someone is chatting
-QUIET_DEFAULT = _bool("QUIET_DEFAULT") is not False  # quiet unless explicitly disabled
+# --- curiosity
+REFLECT_INTERVAL_S = _float("REFLECT_INTERVAL_S", 300)  # turn recent scenes into observations + questions
+CURIOSITY_IDLE_S = _float("CURIOSITY_IDLE_S", 300)  # quiet this long with someone in view → maybe ask something
+QUESTION_REASK_S = _float("QUESTION_REASK_S", 6 * 3600)
+QUESTION_MAX_ASKS = int(_float("QUESTION_MAX_ASKS", 2))
+MAX_OPEN_QUESTIONS = int(_float("MAX_OPEN_QUESTIONS", 12))
+
+QUIET_DEFAULT =_bool("QUIET_DEFAULT") is not False  # quiet unless explicitly disabled
 HEARTBEAT_S = 60

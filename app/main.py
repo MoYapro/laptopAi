@@ -149,6 +149,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         "events": db.recent_events(80),
         "people": [t.public() for t in presence.present()],
         "quiet": agent.quiet,
+        "questions": agent.curiosity.public(),
         "model": llm.model,
     })
     hub.clients.add(client)

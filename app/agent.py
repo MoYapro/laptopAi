@@ -8,10 +8,12 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 
 import config
 from db import DB
+from curiosity import Curiosity
 from faces import Presence, Track
 from llm import Ollama
 from speech import TTS
@@ -40,15 +42,21 @@ DECISION_SCHEMA = {
         "reason": {"type": "string"},
         "action": {"type": "string", "enum": ["speak", "none"]},
         "text": {"type": "string"},
+        "question_id": {"type": "integer"},
     },
-    "required": ["reason", "action", "text"],
+    "required": ["reason", "action", "text", "question_id"],
 }
 
 DECISION_PROMPT = """[Internal check, not said by anyone. Trigger: {trigger}]
 Decide whether to say something to the people in the room right now, on your own initiative.
-Good reasons: greeting someone who just arrived (by name if you know them; you may bring up something you remember about them), welcoming someone you don't know and asking their name, a short friendly remark about something new you notice, or after a restart a brief hello to whoever is there.
-Stay silent if nobody is there to hear you, if you would repeat something you said recently, or if you have nothing worthwhile to add. Unprompted remarks should be rare, short (one or two sentences) and natural.
-Answer as JSON: reason (short, for your log), action ("speak" or "none"), text (what to say; empty for none)."""
+You are curious about your surroundings and the people in them, and you like to learn. Good reasons to speak:
+- greeting someone who just arrived (by name if you know them; you may bring up something you remember about them)
+- welcoming someone you don't know and asking their name
+- asking about something new or interesting you notice, or one of the things you are curious about (listed with #numbers in your situation)
+- after a restart, a brief hello to whoever is there
+Ask at most one question at a time, and keep it light and friendly; people may be busy.
+Stay silent if nobody is there to hear you, if you would repeat something you said recently, or if you have nothing worthwhile to add. Keep it short (one or two sentences) and natural.
+Answer as JSON: reason (short, for your log), action ("speak" or "none"), text (what to say; empty for none), question_id (the #number if you ask one of your listed questions, otherwise 0)."""
 
 MEMORY_SCHEMA = {
     "type": "object",
@@ -62,8 +70,16 @@ MEMORY_SCHEMA = {
                 "required": ["about", "fact"],
             },
         },
+        "answered": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}, "answer": {"type": "string"}},
+                "required": ["id", "answer"],
+            },
+        },
     },
-    "required": ["introduced_name", "facts"],
+    "required": ["introduced_name", "facts", "answered"],
 }
 
 
@@ -85,6 +101,19 @@ def tag_message(content: str, source: str, sender: str | None = None, image: boo
     return f"{header}:\n{content}"
 
 
+STOPWORDS = set("""a an the is are was were be been it its it's this that these those he she they his her their
+him them i you we my your our of to in on at for with and or but not no do does did what what's who whose where
+when why how which name names called user answer answered question""".split())
+
+
+def answer_supported(answer: str, question: str, user_text: str) -> bool:
+    """Small models happily 'answer' questions nobody answered. Accept an answer only if the new
+    information in it (words not already in the question) actually appears in what the person said."""
+    words = lambda s: set(re.findall(r"[a-zäöüß0-9]+", s.lower()))  # noqa: E731
+    novel = words(answer) - words(question) - STOPWORDS
+    return bool(novel & words(user_text))
+
+
 class Agent:
     def __init__(self, db: DB, llm: Ollama, tts: TTS, presence: Presence, hub: Hub, base_prompt):
         self.db, self.llm, self.tts, self.presence, self.hub = db, llm, tts, presence, hub
@@ -93,6 +122,7 @@ class Agent:
         self.user_busy = False
         self.latest_scene: dict | None = db.last_event(["scene"])
         self.claimed: tuple[int, float] | None = None  # (person_id, ts) of a name said in conversation
+        self.curiosity = Curiosity(self)
 
     # ---------------------------------------------------------------- state
 
@@ -176,13 +206,14 @@ class Agent:
                     f"(face not recognized). What you remember about {person['name']}: {known}"
                 )
 
-        if household := self.db.memories(None, 6):
-            lines.append("Other things you remember: " + "; ".join(f["text"] for f in household))
+        if household := self.db.memories(None, 10):
+            lines.append("What you know about this place: " + "; ".join(f["text"] for f in household))
+        lines += self.curiosity.context_lines()
 
         if self.latest_scene:
             lines.append(f"Latest camera description ({ago(self.latest_scene['ts'])}): {self.latest_scene['text']}")
 
-        timeline = self.db.recent_events(15, exclude=["decision", "memory", "setting"])
+        timeline = self.db.recent_events(15, exclude=["decision", "memory", "setting", "initiative_quiet"])
         if timeline:
             lines.append("Recent timeline (oldest first):")
             lines += [f"- {hhmm(e['ts'])} {e['text']}" for e in timeline]
@@ -287,7 +318,8 @@ class Agent:
             log.info("initiative skipped (%s): conversation active", trigger)
             return
         if not bypass_cooldown:
-            last = self.db.last_event(["initiative"])
+            # quiet-mode decisions count for the cooldown (keeps background load down), not for the hourly cap
+            last = self.db.last_event(["initiative", "initiative_quiet"])
             if last and now - last["ts"] < config.INITIATIVE_COOLDOWN_S:
                 log.info("initiative skipped (%s): cooldown", trigger)
                 return
@@ -318,9 +350,15 @@ class Agent:
 
         quiet = self.quiet
         label = "would have said (quiet mode)" if quiet else "said"
-        await self.emit("initiative", f'{label}: "{text}"', {"trigger": trigger, "reason": reason, "quiet": quiet})
+        await self.emit(
+            "initiative_quiet" if quiet else "initiative",
+            f'{label}: "{text}"', {"trigger": trigger, "reason": reason, "quiet": quiet},
+        )
         if quiet:
             return
+        qid = decision.get("question_id") or 0
+        if qid and qid in {q["id"] for q in self.curiosity.askable(limit=50)}:
+            await self.curiosity.asked(qid)
         self.db.add_message("assistant", text, "initiative", self.present_names())
         await self.hub.broadcast(
             {"type": "assistant", "text": text, "source": "initiative", "reason": reason, "ts": time.time()}
@@ -352,7 +390,9 @@ class Agent:
             {"role": "user", "content": task, "images": images},
         ]
         async with self.lock:
-            return (await self.llm.complete(messages, max_tokens=120, temperature=0.2)).strip()
+            caption = await self.llm.complete(messages, max_tokens=120, temperature=0.2)
+        # The model likes "**Change:**" headings; the log should be plain sentences.
+        return re.sub(r"\s+", " ", re.sub(r"[*#_`]+", "", caption)).strip()
 
     # --------------------------------------------------------------- memory
 
@@ -379,16 +419,28 @@ class Agent:
             known_facts += [f"{t.name}: {m['text']}" for m in self.db.memories(t.person_id, 20)]
         known_facts += [f"household: {m['text']}" for m in self.db.memories(None, 20)]
 
+        # The message before this exchange: often the AI's own question that the user is now answering.
+        recent = self.db.recent_messages(3, since=time.time() - 900)
+        before = ""
+        if len(recent) == 3 and recent[0]["role"] == "assistant":
+            before = f"Before that, the AI said: {recent[0]['content']}\n"
+
+        open_qs = self.db.open_questions(12)
+        questions = "\n".join(f"#{q['id']} {q['text']}" for q in open_qs) or "none"
+
         prompt = f"""Conversation snippet:
-{tag_message(user_text, source, sender)}
+{before}{tag_message(user_text, source, sender)}
 AI: {reply}
 
 {speaker}
 Already remembered: {"; ".join(known_facts) or "nothing"}
+Open questions the AI wants answered:
+{questions}
 
 Return JSON:
 - introduced_name: the name the user just said they are called ("I'm Anna", "my name is Anna"); otherwise "".
-- facts: new durable facts worth remembering for future conversations (interests, projects, plans, preferences, important events, relationships). Each has "about" (the person's name, or "household" if general or unclear) and "fact" (one short sentence in third person, using the name). Skip small talk, things only relevant right now, and anything already remembered. Usually this list is empty."""
+- facts: new durable facts worth remembering for future conversations (interests, projects, plans, preferences, important events, relationships, things in the home). Each has "about" (the person's name, or "household" if it's about the place or unclear) and "fact" (one short sentence in third person, using names). Skip small talk, things only relevant right now, and anything already remembered. Usually this list is empty.
+- answered: only the open questions that the user's message actually answers, each with "id" (the #number) and "answer" (one short sentence stating the answer, e.g. "The cat is called Mila."). Leave out every question the message does not answer. Usually empty."""
         async with self.lock:
             raw = await self.llm.complete(
                 [{"role": "system", "content": "You maintain the long-term memory of a home AI."},
@@ -410,6 +462,14 @@ Return JSON:
                 pid = self.db.get_or_create_person(about)["id"]
             if self.db.add_memory(fact, pid):
                 await self.emit("memory", f"remembered{f' about {about}' if pid else ''}: {fact}")
+
+        by_id = {q["id"]: q for q in open_qs}
+        for item in result.get("answered", [])[:3]:
+            q, answer = by_id.get(item.get("id")), item.get("answer", "")
+            if q and answer_supported(answer, q["text"], user_text):
+                await self.curiosity.answered(q["id"], answer)
+            elif q:
+                log.info("ignored unsupported answer to #%s: %r", q["id"], answer)
 
     async def learn_name(self, name: str, track_key: str | None = None) -> None:
         """Bind a name to an unknown face: the given track, or the only unknown face in view."""

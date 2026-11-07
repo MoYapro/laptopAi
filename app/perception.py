@@ -89,6 +89,9 @@ class Perception:
             or (people and since >= config.SCENE_MAX_INTERVAL_S)
         )
         if not due or self.agent.user_busy:
+            # Background curiosity (both are cheap checks that rarely call the model).
+            await self.agent.curiosity.maybe_reflect()
+            await self.agent.curiosity.maybe_ask()
             return
 
         self.force_describe = False
