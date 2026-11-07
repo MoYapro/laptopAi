@@ -1,0 +1,10 @@
+# XPS laptop (GTX 1650 / RTX 3050, 4 GB). Needs the NVIDIA driver + nvidia-container-toolkit on the host.
+services:
+  llm:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

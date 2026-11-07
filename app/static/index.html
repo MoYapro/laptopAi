@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>laptopai</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span id="state" class="pill idle">idle</span><span id="model"></span></div>
+  <div class="toggles">
+    <label title="Quiet: it still decides, but only logs what it would have said"><input type="checkbox" id="quiet"> quiet</label>
+    <label title="Attach the current camera frame to your messages"><input type="checkbox" id="camera" checked> camera</label>
+    <label title="Play spoken replies in this browser"><input type="checkbox" id="speak"> speak</label>
+  </div>
+</header>
+
+<main>
+  <aside>
+    <div class="cam">
+      <img id="cam" alt="Live camera view">
+      <div class="camoff">camera unavailable</div>
+    </div>
+
+    <h2>In view</h2>
+    <ul id="people" class="people"><li class="empty">nobody recognized</li></ul>
+
+    <h2>Timeline</h2>
+    <ol id="timeline" class="timeline"></ol>
+  </aside>
+
+  <section id="log" aria-live="polite"></section>
+</main>
+
+<form id="composer">
+  <textarea id="text" rows="1" placeholder="Type a message… (Enter to send)" autofocus></textarea>
+  <button type="button" id="mic" title="Hold to talk (or hold Space while not typing)">🎙</button>
+  <button type="submit" id="send">Send</button>
+</form>
+
+<dialog id="viewer"><img alt="Snapshot"><p></p><button type="button">Close</button></dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

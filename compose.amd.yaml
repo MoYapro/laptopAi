@@ -1,0 +1,13 @@
+# This desktop (Radeon RX 9070): ROCm build, reusing the existing ~/.ollama models.
+# Don't run the standalone `ollama` container at the same time (same port, same GPU).
+services:
+  llm:
+    image: ollama/ollama:rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      HSA_OVERRIDE_GFX_VERSION: "12.0.1"
+    volumes:
+      - ${HOME}/.ollama:/root/.ollama
+      - ${HOME}/.lmstudio/models:/models:ro

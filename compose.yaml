@@ -1,0 +1,46 @@
+# Shared definition for every machine. Host-specific bits live in .env and
+# compose.<gpu>.yaml (selected via COMPOSE_FILE in .env).
+name: laptopai
+
+services:
+  llm:
+    profiles: [llm]   # enable via COMPOSE_PROFILES=llm, or leave off and point OLLAMA_URL at an external Ollama
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:--1}
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    user: "${UID:-1000}:${GID:-1000}"
+    group_add:
+      - "${VIDEO_GID:-44}"   # numeric gid of the host's `video` group, for webcam access
+    devices:
+      - "${CAMERA_DEVICE:-/dev/video0}:/dev/video0"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://llm:11434}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.5:4b}
+      LLM_THINK: ${LLM_THINK:-false}   # thinking adds seconds of silence before every reply
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
+      PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
+    stop_grace_period: 20s   # time to write the shutdown event
+    volumes:
+      - /etc/localtime:/etc/localtime:ro   # host time zone, so timestamps are local time
+      - ./data:/data        # database (timeline, memory, faces), snapshots, optional system_prompt.md
+      - models:/models      # whisper / piper model files (downloaded on first use)
+    ports:
+      # localhost only: the page shows the camera, and browsers only allow
+      # microphone access on localhost or https anyway.
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  ollama: {}
+  models: {}
