@@ -7,6 +7,8 @@ import time
 
 import numpy as np
 
+from util import is_momentary
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, ts REAL NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, data TEXT
@@ -242,16 +244,20 @@ class DB:
         return new_id
 
     def add_memory(self, text: str, pid: int | None) -> bool:
-        """Store a fact unless an identical one exists. Returns True if stored."""
+        """Store a fact unless an identical one exists or it is only about a single moment. Returns True if stored."""
         text = text.strip()
         dup = self._q(
             "SELECT 1 FROM memories WHERE person_id IS ? AND lower(text) = lower(?) AND archived_ts IS NULL",
             (pid, text),
         )
-        if dup or not text:
+        if dup or not text or is_momentary(text):
             return False
         self._insert("INSERT INTO memories (ts, person_id, text) VALUES (?, ?, ?)", (time.time(), pid, text))
         return True
+
+    def memory_text(self, mid: int) -> str:
+        rows = self._q("SELECT text FROM memories WHERE id = ?", (mid,))
+        return rows[0]["text"] if rows else ""
 
     def memories(self, pid: int | None, limit: int) -> list[dict]:
         rows = self._q(
@@ -318,6 +324,12 @@ class DB:
                     c.execute("INSERT OR IGNORE INTO topic_links (a, b, ts) VALUES (?, ?, ?)",
                               (min(other, dst), max(other, dst), time.time()))
             c.execute("DELETE FROM topics WHERE id = ?", (src,))
+
+    def delete_topic(self, tid: int) -> None:
+        with self._lock:
+            for table, col in (("memory_topics", "topic_id"), ("topic_people", "topic_id"), ("topic_links", "a"),
+                               ("topic_links", "b"), ("topics", "id")):
+                self._conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (tid,))
 
     def delete_empty_topics(self) -> int:
         """Topics with no active facts and nobody linked are leftovers of earlier runs."""

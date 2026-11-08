@@ -67,3 +67,16 @@ def clean_for_speech(text: str) -> str:
 def word_similarity(a: str, b: str) -> float:
     wa, wb = set(re.findall(r"\w+", a.lower())), set(re.findall(r"\w+", b.lower()))
     return len(wa & wb) / max(1, len(wa | wb))
+
+
+# A fact about a single moment is no memory: what someone wears or does right now, what just appeared.
+# Habits ("Tom often wears headphones") and projects ("Tom is converting his laptop") don't match.
+MOMENTARY = re.compile(
+    r"\b(currently|right now|at the moment|just now|today|has (just )?appeared|was wearing"
+    r"|is (wearing|sitting|resting|holding|drinking|eating|lying|standing|leaning|playing))\b",
+    re.I,
+)
+
+
+def is_momentary(text: str) -> bool:
+    return bool(MOMENTARY.search(text))

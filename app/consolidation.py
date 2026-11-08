@@ -4,8 +4,9 @@ Runs when the room has been quiet for a while (or on demand via POST /api/consol
   0. back up the database (data/backups/, last BACKUPS_KEEP kept)
   1. catch up: read conversations since the last run, add facts the per-reply extraction missed and
      note which topics were discussed with whom
-  2. reorganize: rewrite or archive facts (duplicates, wrong person, outdated, trivial), sort facts into
-     topics, merge duplicate topics, link related topics, link topics to people, write person profiles
+  2. reorganize: drop facts about a single moment (code), then separate small model calls: merge duplicate
+     or contradicting pairs, correct facts (wrong person, Housemate mixed up with a person),
+     sort facts into topics (merging duplicate topics), write person profiles, link related topics
 Every change is reversible: edited/removed facts are archived (memories.archived_ts / replaced_by), not deleted.
 The memory model runs outside the conversation lock: Ollama serves it next to the chat model
 (on the laptop on CPU via MEMORY_NUM_GPU=0), and the job stops between steps when someone shows up.
@@ -20,7 +21,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import config
-from util import fmt_dur, hhmm, word_similarity
+from util import fmt_dur, hhmm, is_momentary, word_similarity
 
 if TYPE_CHECKING:
     from agent import Agent
@@ -28,9 +29,36 @@ if TYPE_CHECKING:
 log = logging.getLogger("consolidation")
 
 # Guards the 9B model doesn't reliably follow on its own:
-MOMENTARY = re.compile(r"\b(currently|right now|at the moment|is wearing|is sitting|today)\b", re.I)
-MERGE_MIN_SIMILARITY = 0.5  # only near-identical facts may be merged; different facts stay separate
+CLOTHES = re.compile(r"\b(wears?|wearing|hoodie|blanket|shirt|jacket|sweater)\b", re.I)  # not for profiles
+MOMENTARY_TOPIC = re.compile(r"\b(current|currently|attire|clothes|clothing|outfit)\b", re.I)
+DUPLICATE_CANDIDATE_SIMILARITY = 0.4  # content words two facts share (of the shorter one) to be compared as a pair
+MAX_DUPLICATE_PAIRS = 12
+MENTIONS_HOUSEMATE = re.compile(r"\b(housemate|the ai|ai's)\b", re.I)
+# Without thinking the 9B model calls every pair "same"; with it, it tells them apart. Thinking counts against the
+# output limit and takes about 8k tokens for 12 pairs.
+PAIRS_THINK_TOKENS = 16000
+DATE_OR_TIME = re.compile(r"\b\d{1,2}\.\d{1,2}\b|\b\d{1,2}:\d{2}\b")  # copied from a prompt into a fact
+CATCH_ALL_TOPIC = re.compile(r"\b(general|misc|miscellaneous|other|various|context|stuff|things|household)\b", re.I)
+TOPIC_OVERLAP_MERGE = 0.6  # topics sharing this much of the smaller one's facts are merged into the bigger one
+FILLER_WORDS = set("""the a an and or but of to in on at for with by from as is are was were be been has have had it its
+this that these those he she they his her their him them who which what when where while also not no can now
+""".split())
+
+
+def content_words(text: str) -> set[str]:
+    return {w.rstrip("s") for w in re.findall(r"[a-z]+", text.lower()) if len(w) > 2 and w not in FILLER_WORDS}
 DUPLICATE_SIMILARITY = 0.6  # a "new" fact this close to a stored one is a duplicate
+
+
+def fits(text: str, longest: int) -> bool:
+    """A rewritten or merged fact: one durable sentence, not much longer than what it replaces."""
+    return (bool(text) and not is_momentary(text) and not DATE_OR_TIME.search(text)
+            and len(text) <= min(240, longest * 1.25 + 15))
+
+
+def name_words(name: str) -> set[str]:
+    """'Guests' and 'Guest identification' share 'guest'."""
+    return {w.rstrip("s") for w in re.findall(r"[a-z]+", name.lower()) if len(w) > 3}
 
 
 def person_named_in(text: str, people: dict) -> dict | None:
@@ -61,25 +89,53 @@ CATCHUP_SCHEMA = {
     "required": ["facts", "topics"],
 }
 
-ORGANIZE_SCHEMA = {
+FACTS_SCHEMA = {
     "type": "object",
     "properties": {
-        "changes": {
+        "corrections": {
             "type": "array",
+            "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer"},
-                    "action": {"type": "string", "enum": ["rewrite", "archive"]},
-                    "about": {"type": "string"},
                     "text": {"type": "string"},
-                    "replaces": {"type": "array", "items": {"type": "integer"}},
-                    "duplicate_of": {"type": "integer"},
+                    "about": {"type": "string"},
                     "reason": {"type": "string"},
                 },
-                "required": ["id", "action", "about", "text", "replaces", "duplicate_of", "reason"],
+                "required": ["id", "text", "about", "reason"],
             },
         },
+    },
+    "required": ["corrections"],
+}
+
+DUPLICATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pairs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                # Ollama writes the keys in alphabetical order; the prefixes make the model compare first and
+                # decide after (with "keep" first it picked "same" for every pair).
+                "properties": {
+                    "a_pair": {"type": "integer"},
+                    "b_difference": {"type": "string"},
+                    "c_relation": {"type": "string", "enum": ["different", "same", "contradict"]},
+                    "d_keep": {"type": "string", "enum": ["A", "B"]},
+                    "e_text": {"type": "string"},
+                },
+                "required": ["a_pair", "b_difference", "c_relation", "d_keep", "e_text"],
+            },
+        },
+    },
+    "required": ["pairs"],
+}
+
+TOPICS_SCHEMA = {
+    "type": "object",
+    "properties": {
         "topics": {
             "type": "array",
             "items": {
@@ -88,23 +144,26 @@ ORGANIZE_SCHEMA = {
                     "name": {"type": "string"},
                     "summary": {"type": "string"},
                     "fact_ids": {"type": "array", "items": {"type": "integer"}},
-                    "people": {"type": "array", "items": {"type": "string"}},
-                    "related": {"type": "array", "items": {"type": "string"}},
-                    "merged_from": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["name", "summary", "fact_ids", "people", "related", "merged_from"],
+                "required": ["name", "summary", "fact_ids"],
             },
         },
-        "profiles": {
+        "merges": {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"person": {"type": "string"}, "profile": {"type": "string"}},
-                "required": ["person", "profile"],
+                "properties": {"from": {"type": "string"}, "into": {"type": "string"}},
+                "required": ["from", "into"],
             },
         },
     },
-    "required": ["changes", "topics", "profiles"],
+    "required": ["topics", "merges"],
+}
+
+PROFILE_SCHEMA = {
+    "type": "object",
+    "properties": {"profile": {"type": "string"}},
+    "required": ["profile"],
 }
 
 LINK_SCHEMA = {
@@ -150,20 +209,63 @@ Return JSON:
 - facts: at most 8 durable facts from these conversations that are NOT already remembered (interests, projects, plans, preferences, relationships, important events, things and animals in the home). "about" is the name of the known person the fact is about, or "household" for the place, animals or anyone else; "fact" is one short third-person sentence with names. Only use what people in the room said; developer tool messages are just context. Skip anything about a single moment (what someone is wearing or doing right now). Often empty.
 - topics: the topics that were actually talked about, with the names of the known people who talked about them ("people" may be empty). Reuse an existing topic name when it fits; otherwise a short general name like "Sim racing" or "Luna the cat"."""
 
-ORGANIZE_PROMPT = """All facts Housemate currently remembers (#id [about] text):
+FACTS_PROMPT = """All facts Housemate remembers (#id [about] text):
 {facts}
 
-People Housemate knows: {people}
-Existing topics (name: summary; people; related):
+People Housemate knows: {people}.
+Housemate itself is the AI in the laptop: it watches the room through a webcam and talks. It cannot play games, eat,
+wear clothes or go anywhere, so a fact saying it does is a mix-up with a person.
+
+Find facts that are wrong as written and correct them. Return JSON: corrections, each with id, the corrected text
+(one short sentence), about (a known person's name or "household") and a short reason (max 15 words). Only these
+mistakes count:
+- attached to the wrong person: a "household" fact that is clearly about a known person, or the other way round
+- Housemate mixed up with a person: the fact says Housemate (or "the AI") did something only a person can do,
+  like playing a game. Then the person is the subject.
+Never put Housemate into a fact about what a person does or has: "Tom wears headphones" stays as it is.
+A fact that is fine as it is must not appear. Usually the list is empty or very short."""
+
+DUPLICATES_PROMPT = """Pairs of facts from Housemate's memory that share some words ([about] in front):
+{pairs}
+
+For each pair, compare A and B. Return JSON: pairs, each with
+- a_pair: its number
+- b_difference: in a few words, what one of them says that the other does not ("nothing" if they say the same)
+- c_relation:
+  "same": they say the same thing in other words, or one is a shorter version of the other ("Tom sim races" /
+  "Tom enjoys sim racing on his steering wheel"). They become one sentence.
+  "contradict": one shows the other is wrong ("an unknown man was seen" / "that man was Tom"; "Luna's name is
+  Mia" / "the cat is called Luna"). The wrong one is dropped.
+  "different": each says something the other does not ("Luna sleeps in her hammock" / "Luna shifts her paws").
+  Both stay.
+- d_keep: for "contradict", the one that is right: what a person said or confirmed beats a guess from the camera,
+  otherwise the newer one (B). Else "A".
+- e_text: for "same", one short sentence that says it once and keeps every detail of both. Else "".
+Sharing a subject (the same person, cat or object) does not make two facts the same."""
+
+TOPICS_PROMPT = """Facts Housemate remembers (#id [about] text):
+{facts}
+
+Existing topics (name: summary):
 {topics}
 
-Reorganize this memory. Return JSON:
-- changes: only facts that need fixing. Each has id, action, about, text, replaces, duplicate_of and a short reason (max 15 words):
-  - "rewrite": the corrected "text" (one short sentence, one fact) and "about". Use it to attach a fact to the right person (if a "household" fact is clearly about a known person, set about to that person's name), to correct a fact that a newer one updates, or to merge facts that say THE SAME THING into one sentence: then list the other ids in "replaces" (they are removed). Never merge different facts into one long sentence. Never move a fact about a person to "household".
-  - "archive": the fact is trivial, only about one moment, or contradicted by a newer fact; or it duplicates another fact, then put that fact's id in "duplicate_of" (else 0). Copy "about" and "text" from the original; "replaces" is empty.
-  "about" is always a known person's name or "household". Leave correct facts alone. Usually only a few changes are needed.
-- topics: group the facts into topics (a fact may belong to several). Each topic: a short name, a one-sentence summary of what Housemate knows about it, fact_ids (ids of the facts above that belong to it), people (known people connected to it), related (names of other topics in your list that belong together with it), merged_from (names of existing topics that are duplicates of this one, else empty). Keep existing topic names when they still fit. Prefer a handful of meaningful topics over many tiny ones.
-- profiles: for each known person with facts, a 1-2 sentence profile in third person: who they are and what matters to them. No momentary details (clothes, what they are doing right now)."""
+Sort the facts into topics. Return JSON:
+- topics: name, summary and fact_ids for each topic. Reuse the existing topic names wherever they fit. A topic is
+  about one thing (a hobby, a game, an animal, a project, a preference, a visitor), never a catch-all like
+  "Household" or a person's name. Each fact belongs to one or two topics. Create a new topic only for facts that no
+  existing topic fits. No topics for momentary things (clothes, what someone is doing right now). summary: one
+  short sentence (max 25 words) on what Housemate knows about it, not a list of all its facts.
+- merges: existing topics that are the same subject under two names: from (the name to drop) and into (the name to
+  keep). Usually empty."""
+
+PROFILE_PROMPT = """What Housemate remembers about {name}:
+{facts}
+
+Current profile: {profile}
+
+Write {name}'s profile: two or three sentences in third person about who they are and what matters to them: their
+main interests, projects, preferences, and the people and animals in their life. Keep what is still true from the
+current profile. Not their looks or clothes, nothing they are doing right now. Return JSON: profile."""
 
 
 class Consolidator:
@@ -216,7 +318,7 @@ class Consolidator:
             await self.agent.emit("consolidation", f"memory review skipped: none of {config.MEMORY_MODELS} is in Ollama")
             return {"status": "no model"}
         t0 = time.time()
-        stats = {"model": model, "trigger": trigger, "added": 0, "rewritten": 0, "archived": 0,
+        stats = {"model": model, "trigger": trigger, "added": 0, "merged_facts": 0, "rewritten": 0, "archived": 0,
                  "topics": 0, "merged_topics": 0, "links": 0, "profiles": 0, "changes": []}
         backup = self._backup()
         log.info("memory review started (%s, %s), backup %s", model, trigger, backup)
@@ -235,7 +337,8 @@ class Consolidator:
         self.db.set_setting("consolidated_at", str(self.last_run))
         removed = self.db.delete_empty_topics()
         parts = [
-            f"{stats['added']} new facts", f"{stats['rewritten']} rewritten", f"{stats['archived']} archived",
+            f"{stats['added']} new facts", f"{stats['merged_facts']} merged", f"{stats['rewritten']} rewritten",
+            f"{stats['archived']} archived",
             f"{stats['topics']} topics", f"{stats['links']} topic links", f"{stats['profiles']} profiles",
         ]
         if stats["merged_topics"]:
@@ -263,16 +366,22 @@ class Consolidator:
             old.unlink()
         return f"backups/{path.name}"
 
-    async def _ask(self, model: str, prompt: str, schema: dict, max_tokens: int) -> dict:
+    async def _ask(self, model: str, prompt: str, schema: dict, max_tokens: int, think: bool | None = None) -> dict:
         options = {"num_ctx": config.MEMORY_NUM_CTX}
         if config.MEMORY_NUM_GPU >= 0:
             options["num_gpu"] = config.MEMORY_NUM_GPU
-        raw = await self.llm.complete(
-            [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
-            schema=schema, max_tokens=max_tokens, temperature=0.1, model=model,
-            think=config.MEMORY_THINK, options=options, keep_alive="5m",
-        )
-        return json.loads(raw)
+        for attempt in (1, 2):
+            raw = await self.llm.complete(
+                [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+                schema=schema, max_tokens=max_tokens, temperature=0.1 if attempt == 1 else 0.3, model=model,
+                think=config.MEMORY_THINK if think is None else think, options=options, keep_alive="5m",
+            )
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                if attempt == 2:
+                    raise
+                log.warning("invalid JSON from %s (%d chars, %s), retrying", model, len(raw), e)
 
     # ------------------------------------------------- step 1: conversations
 
@@ -310,7 +419,7 @@ class Consolidator:
 
             for item in result.get("facts", [])[:8]:
                 fact = item.get("fact", "").strip()
-                if not fact or MOMENTARY.search(fact):
+                if not fact or is_momentary(fact):
                     continue
                 person = people.get(item.get("about", "").strip().lower()) or person_named_in(fact, people)
                 if any(word_similarity(fact, m["text"]) >= DUPLICATE_SIMILARITY for m in self.db.active_memories()):
@@ -345,129 +454,229 @@ class Consolidator:
     # ---------------------------------------------------- step 2: organizing
 
     async def _organize(self, model: str, stats: dict) -> None:
-        memories = {m["id"]: m for m in self.db.active_memories()}
-        if not memories:
+        """Three small questions instead of one big one: the 9B model loses track (and the JSON) otherwise."""
+        if not self.db.active_memories():
             return
-        people = {p["name"].lower(): p for p in self.db.people()}
-        topics = self.db.topics()
-        topic_lines = "\n".join(
-            f"- {t['name']}: {t['summary'] or '(no summary yet)'}; people: "
-            f"{', '.join(p['name'] for p in t['people']) or '-'}; related: {', '.join(r['name'] for r in t['related']) or '-'}"
-            for t in topics
-        ) or "none yet"
-        result = await self._ask(model, ORGANIZE_PROMPT.format(
+        self._drop_momentary(stats)
+        await self._merge_duplicates(model, stats)
+        await self._clean_facts(model, stats)
+        await self._sort_topics(model, stats)
+        await self._write_profiles(model, stats)
+        await self._link_topics(model, stats)
+
+    def _people(self) -> dict:
+        return {p["name"].lower(): p for p in self.db.people()}
+
+    @staticmethod
+    def _person_for(people: dict, about: str, text: str, current: int | None) -> int | None:
+        # A fact about a person stays with a person: "household" never detaches it.
+        person = people.get(about.strip().lower()) or person_named_in(text, people)
+        return person["id"] if person else current
+
+    def _drop_momentary(self, stats: dict) -> None:
+        """Facts about a single moment ("Tom is wearing …", "… currently …") are no memories. The extraction
+        steps no longer store them; this clears out the ones stored before."""
+        for m in self.db.active_memories():
+            if is_momentary(m["text"]):
+                self.db.archive_memory(m["id"], "about a single moment")
+                stats["archived"] += 1
+                stats["changes"].append({"archived": m["text"], "reason": "about a single moment"})
+
+    async def _merge_duplicates(self, model: str, stats: dict) -> None:
+        """Code picks pairs of similar facts; the model only answers "same thing?" for each pair, which a 9B model
+        does far more reliably than finding duplicate groups among all facts."""
+        memories = self.db.active_memories()
+        names = {p["name"].lower() for p in self.db.people()}
+        words = {m["id"]: content_words(m["text"]) - names for m in memories}
+        candidates = []
+        for i, a in enumerate(memories):
+            for b in memories[i + 1:]:
+                if a["person_id"] and b["person_id"] and a["person_id"] != b["person_id"]:
+                    continue
+                wa, wb = words[a["id"]], words[b["id"]]
+                if len(wa) < 2 or len(wb) < 2:
+                    continue
+                if (sim := len(wa & wb) / min(len(wa), len(wb))) >= DUPLICATE_CANDIDATE_SIMILARITY:
+                    candidates.append((sim, a, b))
+        pairs = [(a, b) for _, a, b in sorted(candidates, key=lambda c: -c[0])[:MAX_DUPLICATE_PAIRS]]
+        if not pairs:
+            return
+        schema = json.loads(json.dumps(DUPLICATES_SCHEMA))
+        schema["properties"]["pairs"]["maxItems"] = len(pairs)
+        pairs = [(a, b) if a["ts"] <= b["ts"] else (b, a) for a, b in pairs]  # A is always the older one
+        result = await self._ask(model, DUPLICATES_PROMPT.format(pairs="\n".join(
+            f"{n}. A (older): [{a['person'] or 'household'}] {a['text']}\n"
+            f"   B (newer): [{b['person'] or 'household'}] {b['text']}"
+            for n, (a, b) in enumerate(pairs, 1)
+        )), schema, PAIRS_THINK_TOKENS, think=True)
+
+        people = self._people()
+        name_of = {p["id"]: p["name"] for p in people.values()}
+        done: set[int] = set()  # a fact merged once waits for the next run before it can merge again
+        dropped: set[int] = set()  # archived as wrong: can't be the "right" side of a contradiction any more
+        merged_into: dict[int, int] = {}  # a merged fact lives on in the new one
+        for item in result.get("pairs", []):
+            n, relation = item.get("a_pair"), item.get("c_relation")
+            if relation not in ("same", "contradict") or not isinstance(n, int) or not 1 <= n <= len(pairs):
+                continue
+            a, b = pairs[n - 1]
+            log.info("pair %d %s (keep %s; %s): %r / %r", n, relation, item.get("d_keep"), item.get("b_difference"),
+                     a["text"], b["text"])
+            if relation == "contradict":
+                # Either side may already be merged into a new fact this run; then that new fact is what's
+                # kept or dropped.
+                keep, drop = (a, b) if item.get("d_keep") != "B" else (b, a)
+                keep_id, drop_id = merged_into.get(keep["id"], keep["id"]), merged_into.get(drop["id"], drop["id"])
+                if keep_id in dropped or drop_id in dropped or keep_id == drop_id:
+                    continue
+                drop_text = drop["text"] if drop_id == drop["id"] else self.db.memory_text(drop_id)
+                reason = f"contradicted by #{keep_id}: {keep['text']}"[:200]
+                self.db.archive_memory(drop_id, reason)
+                done.add(drop["id"])
+                dropped.add(drop_id)
+                stats["archived"] += 1
+                stats["changes"].append({"archived": drop_text, "reason": reason})
+                continue
+            if a["id"] in done or b["id"] in done:
+                continue
+            text = item.get("e_text", "").strip()
+            if a["id"] in done or b["id"] in done or not fits(text, max(len(a["text"]), len(b["text"]))):
+                continue
+            newer, older = (a, b) if a["ts"] >= b["ts"] else (b, a)
+            pid = self._person_for(people, "", text, newer["person_id"] or older["person_id"])
+            new_id = self.db.replace_memory(newer["id"], text, pid, "merged duplicates")
+            self.db.archive_memory(older["id"], f"merged into #{new_id}", replaced_by=new_id)
+            done.update((a["id"], b["id"]))
+            merged_into.update({a["id"]: new_id, b["id"]: new_id})
+            stats["merged_facts"] += 2
+            stats["changes"].append({"merged": [older["text"], newer["text"]], "into": text,
+                                     "about": name_of.get(pid, "household")})
+
+    async def _clean_facts(self, model: str, stats: dict) -> None:
+        memories = {m["id"]: m for m in self.db.active_memories()}
+        people = self._people()
+        name_of = {p["id"]: p["name"] for p in people.values()}
+        result = await self._ask(model, FACTS_PROMPT.format(
             facts="\n".join(f"#{m['id']} [{m['person'] or 'household'}] {m['text']}" for m in memories.values()),
             people=", ".join(p["name"] for p in people.values()) or "nobody yet",
-            topics=topic_lines,
-        ), ORGANIZE_SCHEMA, 6000)
+        ), FACTS_SCHEMA, 1500)
 
-        # --- fact changes (bounded, reversible)
-        max_archive = max(3, int(len(memories) * config.CONSOLIDATE_MAX_ARCHIVE_FRACTION))
-        renamed: dict[int, int | None] = {}  # old id -> new id (rewritten) or None (archived)
-        name_of = {p["id"]: p["name"] for p in people.values()}
+        done: set[int] = set()  # every fact is changed at most once per run
 
-        def archive(mid: int, reason: str, replaced_by: int | None = None) -> bool:
-            if stats["archived"] >= max_archive:
-                log.info("archive limit reached, keeping #%s", mid)
-                return False
-            self.db.archive_memory(mid, reason, replaced_by)
-            renamed[mid] = None
-            stats["archived"] += 1
-            stats["changes"].append({"archived": memories[mid]["text"], "reason": reason})
-            return True
-
-        for ch in result.get("changes", []):
-            mid, action = ch.get("id"), ch.get("action")
-            reason = (ch.get("reason", "").strip() or "consolidation")[:200]
-            old = memories.get(mid)
-            if old is None or mid in renamed:
+        for ch in result.get("corrections", []):
+            old = memories.get(ch.get("id"))
+            if old is None or old["id"] in done:
                 continue
-            if action == "archive":
-                dup = memories.get(ch.get("duplicate_of") or 0)
-                if dup and dup["id"] not in renamed and old["person_id"] and not dup["person_id"]:
-                    # Keep the version that is attached to a person; drop the household copy instead.
-                    archive(dup["id"], f"duplicate of #{mid}, which is attached to {name_of.get(old['person_id'])}")
-                    continue
-                archive(mid, reason)
-            elif action == "rewrite":
-                text = ch.get("text", "").strip() or old["text"]
-                if MOMENTARY.search(text):
-                    continue
-                person = people.get(ch.get("about", "").strip().lower()) or person_named_in(text, people)
-                # A fact about a person stays with a person: "household" never detaches it.
-                pid = person["id"] if person else old["person_id"]
-                if len(text) > min(240, len(old["text"]) * 1.25 + 15):
-                    log.info("rewrite of #%s grows the fact too much (merging different facts?), skipped: %r", mid, text)
-                    continue
-                if text == old["text"] and pid == old["person_id"]:
-                    continue
-                new_id = self.db.replace_memory(mid, text, pid, reason)
-                renamed[mid] = new_id
-                stats["rewritten"] += 1
-                stats["changes"].append({"from": old["text"], "to": text, "about": name_of.get(pid, "household"),
-                                         "reason": reason})
-                for rid in ch.get("replaces", []):
-                    other = memories.get(rid)
-                    # merge only facts about the same person (or household facts into anything)
-                    if (other and rid != mid and rid not in renamed and other["person_id"] in (None, pid)
-                            and word_similarity(other["text"], old["text"]) >= MERGE_MIN_SIMILARITY):
-                        archive(rid, f"merged into #{new_id}", replaced_by=new_id)
+            text = ch.get("text", "").strip()
+            pid = self._person_for(people, ch.get("about", ""), text, old["person_id"])
+            if not fits(text, len(old["text"])) or (text == old["text"] and pid == old["person_id"]):
+                continue
+            if MENTIONS_HOUSEMATE.search(text) and not MENTIONS_HOUSEMATE.search(old["text"]):
+                log.info("correction of #%s skipped: it writes Housemate into a fact about a person: %r", old["id"], text)
+                continue
+            reason = (ch.get("reason", "").strip() or "consolidation")[:200]
+            self.db.replace_memory(old["id"], text, pid, reason)
+            done.add(old["id"])
+            stats["rewritten"] += 1
+            stats["changes"].append({"from": old["text"], "to": text, "about": name_of.get(pid, "household"),
+                                     "reason": reason})
 
-        # --- topics
-        existing = {t["name"].lower(): t["id"] for t in topics}
-        new_topics = [t for t in result.get("topics", []) if t.get("name", "").strip()][:20]
-        name_to_id: dict[str, int] = {}
-        for t in new_topics:  # pass 1: create/update all topics
-            name_to_id[t["name"].strip().lower()] = self.db.upsert_topic(t["name"], t.get("summary", ""))
+    async def _sort_topics(self, model: str, stats: dict) -> None:
+        memories = {m["id"]: m for m in self.db.active_memories()}
+        topics = self.db.topics()
+        existing = {t["name"].lower(): t for t in topics}
+        result = await self._ask(model, TOPICS_PROMPT.format(
+            facts="\n".join(f"#{m['id']} [{m['person'] or 'household'}] {m['text']}" for m in memories.values()),
+            topics="\n".join(f"- {t['name']}: {t['summary'] or '(no summary yet)'}" for t in topics) or "none yet",
+        ), TOPICS_SCHEMA, 2500)
+
+        # merges first, and only between topics that are recognizably the same subject
+        for m in result.get("merges", []):
+            src, dst = existing.get(str(m.get("from", "")).strip().lower()), existing.get(str(m.get("into", "")).strip().lower())
+            if not src or not dst or src["id"] == dst["id"]:
+                continue
+            if not (name_words(src["name"]) & name_words(dst["name"])
+                    or word_similarity(src["summary"] or "", dst["summary"] or "") >= 0.4):
+                log.info("topic merge %r -> %r skipped: different subjects", src["name"], dst["name"])
+                continue
+            self.db.merge_topic(src["id"], dst["id"])
+            existing.pop(src["name"].lower())
+            stats["merged_topics"] += 1
+            stats["changes"].append({"merged_topic": src["name"], "into": dst["name"]})
+
+        fact_topics: dict[int, list[int]] = {}
+        for t in result.get("topics", [])[:20]:
+            name = t.get("name", "").strip()
+            fids = [f for f in dict.fromkeys(t.get("fact_ids", [])) if f in memories]
+            if not name or (not fids and name.lower() not in existing) or MOMENTARY_TOPIC.search(name):
+                continue
+            if name.lower() not in existing and (CATCH_ALL_TOPIC.search(name) or re.search(r"&| and ", name)):
+                log.info("new catch-all topic %r skipped", name)
+                continue
+            summary = re.split(r"(?<=[.!?])\s+", t.get("summary", "").strip())[0]
+            summary = " ".join(summary.split()[:30])
+            if is_momentary(summary):
+                summary = ""
+            tid = self.db.upsert_topic(name, summary or None)
             stats["topics"] += 1
-
-        merged_into: dict[int, int] = {}  # pass 2: merges (a merged topic is deleted; references are redirected)
-
-        def resolve(tid: int | None) -> int | None:
-            seen = set()
-            while tid in merged_into and tid not in seen:
-                seen.add(tid)
-                tid = merged_into[tid]
-            return tid
-
-        for t in new_topics:
-            dst = resolve(name_to_id[t["name"].strip().lower()])
-            for src in t.get("merged_from", []):
-                src_id = resolve(existing.get(str(src).strip().lower()) or name_to_id.get(str(src).strip().lower()))
-                if src_id and dst and src_id != dst:
-                    self.db.merge_topic(src_id, dst)
-                    merged_into[src_id] = dst
-                    stats["merged_topics"] += 1
-
-        fact_topics: dict[int, list[int]] = {}  # pass 3: facts, people, related topics
-        for t in new_topics:
-            tid = resolve(name_to_id[t["name"].strip().lower()])
-            for fid in t.get("fact_ids", []):
-                fid = renamed.get(fid, fid)
-                if fid is not None and (fid in memories or fid in renamed.values()):
-                    fact_topics.setdefault(fid, []).append(tid)
-            for pname in t.get("people", []):
-                if person := people.get(str(pname).strip().lower()):
-                    self.db.ensure_topic_person(tid, person["id"])
-            for rel in t.get("related", []):
-                key = str(rel).strip().lower()
-                other = resolve(name_to_id.get(key) or existing.get(key))
-                if other and other != tid:
-                    self.db.link_topics(tid, other)
-                    stats["links"] += 1
+            for fid in fids:
+                fact_topics.setdefault(fid, []).append(tid)
+                if memories[fid]["person_id"]:
+                    self.db.ensure_topic_person(tid, memories[fid]["person_id"])
         for fid, tids in fact_topics.items():
-            self.db.set_memory_topics(fid, tids)
+            self.db.set_memory_topics(fid, tids[:2])
+        self._tidy_topics(stats)
 
-        # --- profiles: short and about who someone is, not what they wore today
-        for p in result.get("profiles", []):
-            if (person := people.get(p.get("person", "").strip().lower())) and p.get("profile", "").strip():
-                sentences = [x for x in re.split(r"(?<=[.!?])\s+", p["profile"].strip()) if x and not MOMENTARY.search(x)]
-                if sentences:
-                    self.db.set_profile(person["id"], " ".join(sentences[:3]))
-                    stats["profiles"] += 1
+    def _tidy_topics(self, stats: dict) -> None:
+        """Rules the model doesn't follow reliably: no summaries about a single moment, and topics that hold
+        (nearly) the same facts are one topic."""
+        for t in self.db.topics():
+            if t["summary"] and is_momentary(t["summary"]):
+                self.db.upsert_topic(t["name"], "")
+                t["summary"] = ""
+            if not t["facts"] and not t["summary"]:
+                self.db.delete_topic(t["id"])
+                stats["changes"].append({"removed_topic": t["name"], "reason": "no facts and no summary"})
+        # a topic without facts whose summary another topic already covers is that topic
+        for t in [t for t in self.db.topics() if not t["facts"]]:
+            others = [o for o in self.db.topics() if o["id"] != t["id"] and o["facts"]]
+            best = max(others, key=lambda o: word_similarity(t["summary"], o["summary"] or ""), default=None)
+            if best and word_similarity(t["summary"], best["summary"] or "") >= 0.4:
+                self.db.merge_topic(t["id"], best["id"])
+                stats["merged_topics"] += 1
+                stats["changes"].append({"merged_topic": t["name"], "into": best["name"], "reason": "same summary"})
+        merged = True
+        while merged:  # one merge at a time; the topic list changes with every merge
+            merged = False
+            topics = sorted(self.db.topics(), key=lambda t: -len(t["facts"]))
+            for i, big in enumerate(topics):
+                for small in topics[i + 1:]:
+                    fa, fb = {f["id"] for f in big["facts"]}, {f["id"] for f in small["facts"]}
+                    if fb and len(fa & fb) / len(fb) >= TOPIC_OVERLAP_MERGE:
+                        self.db.merge_topic(small["id"], big["id"])
+                        stats["merged_topics"] += 1
+                        stats["changes"].append({"merged_topic": small["name"], "into": big["name"],
+                                                 "reason": "same facts"})
+                        merged = True
+                        break
+                if merged:
+                    break
 
-        # --- related topics: a small focused question works much better than a field in the big one
-        await self._link_topics(model, stats)
+    async def _write_profiles(self, model: str, stats: dict) -> None:
+        for person in self.db.people():
+            facts = self.db.memories(person["id"], 60)
+            if not facts:
+                continue
+            result = await self._ask(model, PROFILE_PROMPT.format(
+                name=person["name"],
+                facts="\n".join(f"- {f['text']}" for f in facts),
+                profile=person.get("profile") or "none yet",
+            ), PROFILE_SCHEMA, 400)
+            sentences = [s for s in re.split(r"(?<=[.!?])\s+", result.get("profile", "").strip())
+                         if s and not is_momentary(s) and not CLOTHES.search(s)]
+            if sentences:
+                self.db.set_profile(person["id"], " ".join(sentences[:3]))
+                stats["profiles"] += 1
 
     async def _link_topics(self, model: str, stats: dict) -> None:
         topics = self.db.topics()
