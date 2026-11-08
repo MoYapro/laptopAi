@@ -112,6 +112,11 @@ async def index() -> FileResponse:
     return FileResponse(config.APP_DIR / "static" / "index.html")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(config.APP_DIR / "static" / "icons" / "icon-32.png", media_type="image/png")
+
+
 @app.get("/camera.jpg")
 async def camera_jpg() -> Response:
     jpg = await asyncio.to_thread(perception.annotated_jpeg)

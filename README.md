@@ -20,6 +20,10 @@ browser (localhost:8080)                app container (CPU)                     
   image changed. On a real change (or when someone arrives, or every 2 minutes while people are present), it saves a
   timestamped **snapshot** to `data/snapshots/YYYY-MM-DD/HHMMSS.jpg`, and the vision model describes it, **comparing it
   with the previous keyframe** ("what changed"). Unchanged scenes aren't logged.
+- **Voice input**: hold the 🎙 button (or Space) to talk, or switch on **listen always**: the page detects speech by
+  the microphone level against the room's noise floor and sends each utterance after a 0.9 s pause, without a button.
+  It pauses while Housemate thinks or talks (so it doesn't hear itself), drops clicks under 0.35 s and Whisper's usual
+  noise hallucinations ("Thank you.", "you"). Thresholds are in `app/static/app.js` (`VAD`).
 - **Timeline**: every start (with timestamp and how long it was off), shutdown, unexpected shutdown (detected through a
   heartbeat), scene, arrival/departure, decision and new memory is an event in the database and shown live on the page.
   The model sees the recent timeline in its context.

@@ -1,9 +1,10 @@
 const $ = (id) => document.getElementById(id);
 const log = $("log"), text = $("text"), stateEl = $("state");
 const camToggle = $("camera"), speakToggle = $("speak"), quietToggle = $("quiet"), internetToggle = $("internet");
+const listenToggle = $("listen");
 
-// Remember per-browser toggles (speak defaults to off). Quiet is a server setting.
-for (const el of [camToggle, speakToggle]) {
+// Remember per-browser toggles (speak and listen default to off). Quiet is a server setting.
+for (const el of [camToggle, speakToggle, listenToggle]) {
   try {
     const saved = localStorage.getItem("laptopai." + el.id);
     if (saved !== null) el.checked = saved === "1";
@@ -202,15 +203,28 @@ function renderQuestions(qs) {
 
 // ---------------------------------------------------------------- audio out
 const audioQueue = [];
-let playing = false;
+let playing = false, lastPlayedAt = 0;
 function playNext() {
   if (playing || !audioQueue.length) return;
   playing = true;
   const audio = new Audio(audioQueue.shift());
-  const done = () => { URL.revokeObjectURL(audio.src); playing = false; playNext(); };
-  audio.onended = done;
-  audio.onerror = done;
-  audio.play().catch(done);
+  let finished = false, watchdog = setTimeout(() => done("timeout"), 30000);
+  const done = (why) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(watchdog);
+    if (why === "timeout") console.warn("audio playback never finished; skipping it (output device stalled?)");
+    audio.pause();
+    URL.revokeObjectURL(audio.src); playing = false; lastPlayedAt = Date.now(); playNext();
+  };
+  // A stalled output device never fires "ended": that would block the queue (and always-on listening) forever.
+  audio.onloadedmetadata = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => done("timeout"), (audio.duration || 25) * 1000 + 3000);
+  };
+  audio.onended = () => done();
+  audio.onerror = () => done();
+  audio.play().catch(() => done());
 }
 function enqueueWav(b64) {
   if (!speakToggle.checked) return;
@@ -223,7 +237,7 @@ function enqueueWav(b64) {
 let ws, botDiv = null, busy = false;
 function connect() {
   ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
-  ws.onopen = () => setState("idle");
+  ws.onopen = () => { busy = false; setState("idle"); };  // a turn running before a server restart is gone
   ws.onclose = () => { setState("offline"); setTimeout(connect, 2000); };
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
@@ -340,16 +354,7 @@ async function startRec() {
       $("mic").classList.remove("rec");
       const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
       if (blob.size < 2000) { setState("idle"); return; }  // accidental tap
-      setState("transcribing");
-      const form = new FormData();
-      form.append("audio", blob, "speech.webm");
-      try {
-        const r = await (await fetch("/api/transcribe", { method: "POST", body: form })).json();
-        if (r.text) sendTurn(r.text, "voice", r.ms);
-        else { addMsg("notice", "didn't catch that"); setState("idle"); }
-      } catch (err) {
-        addMsg("error", "transcription failed: " + err); setState("idle");
-      }
+      await transcribeAndSend(blob, false);
     };
     recorder.start();
     $("mic").classList.add("rec");
@@ -359,6 +364,127 @@ async function startRec() {
   }
 }
 function stopRec() { if (recorder && recorder.state === "recording") recorder.stop(); }
+
+// Whisper "hears" these in noise, music or silence; from always-on listening they are dropped.
+const HALLUCINATIONS = /^\W*(thank you|thanks|thanks for watching|thank you for watching|you|bye|okay|so|um+|uh+|hmm+|silence|music|applause|untertitel.*|vielen dank)\W*$/i;
+
+async function transcribeAndSend(blob, automatic) {
+  setState("transcribing");
+  const form = new FormData();
+  form.append("audio", blob, "speech.webm");
+  try {
+    const r = await (await fetch("/api/transcribe", { method: "POST", body: form })).json();
+    const said = (r.text || "").trim();
+    if (automatic && (said.length < 3 || HALLUCINATIONS.test(said))) {
+      if (said) console.debug("listen: dropped", JSON.stringify(said));
+      setState("idle");
+    } else if (said) {
+      sendTurn(said, "voice", r.ms);
+    } else {
+      if (!automatic) addMsg("notice", "didn't catch that");
+      setState("idle");
+    }
+  } catch (err) {
+    addMsg("error", "transcription failed: " + err); setState("idle");
+  }
+}
+
+// ---------------------------------------------------------------- listen always
+// Voice activity detection on the microphone level: recording starts when it rises clearly above the (adapting)
+// noise floor and stops after a pause. Paused while Housemate thinks or talks, so it doesn't hear itself.
+const VAD = {
+  frameMs: 30,
+  startFactor: 3.0,     // speech = this much louder than the noise floor ...
+  minLevel: 0.012,      // ... and at least this loud (RMS, 0..1)
+  endSilenceMs: 900,    // pause that ends an utterance
+  minSpeechMs: 350,     // shorter = a click or a cough
+  maxMs: 30000,
+  afterPlaybackMs: 700, // the room echo of its own voice
+};
+let listen = null;  // {stream, ctx, analyser, timer, floor, rec, chunks, started, lastVoice, voicedMs}
+
+function listenPaused() {
+  return busy || playing || recorder || Date.now() - lastPlayedAt < VAD.afterPlaybackMs;
+}
+
+async function startListening() {
+  if (listen) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    });
+    const ctx = new AudioContext();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    listen = { stream, ctx, analyser, floor: 0.005, rec: null, chunks: [], started: 0, lastVoice: 0, voicedMs: 0 };
+    listen.timer = setInterval(listenTick, VAD.frameMs);
+    // Opened without a click (toggle remembered from last time), the browser may keep audio suspended until one.
+    if (ctx.state === "suspended") {
+      addMsg("notice", "listening starts after the first click or key press on the page");
+      const resume = () => { ctx.resume(); document.removeEventListener("pointerdown", resume, true);
+                             document.removeEventListener("keydown", resume, true); };
+      document.addEventListener("pointerdown", resume, true);
+      document.addEventListener("keydown", resume, true);
+    }
+    $("mic").classList.add("always");
+  } catch (err) {
+    listenToggle.checked = false;
+    try { localStorage.setItem("laptopai.listen", "0"); } catch {}
+    addMsg("error", "microphone unavailable: " + err.message);
+  }
+}
+
+function stopListening() {
+  if (!listen) return;
+  clearInterval(listen.timer);
+  if (listen.rec && listen.rec.state === "recording") { listen.rec.onstop = null; listen.rec.stop(); }
+  listen.stream.getTracks().forEach((t) => t.stop());
+  listen.ctx.close();
+  listen = null;
+  $("mic").classList.remove("always", "rec");
+}
+
+function listenTick() {
+  const l = listen, buf = new Float32Array(l.analyser.fftSize);
+  l.analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (const v of buf) sum += v * v;
+  const level = Math.sqrt(sum / buf.length), now = Date.now();
+  const loud = level > Math.max(l.floor * VAD.startFactor, VAD.minLevel);
+
+  if (listenPaused()) {  // Housemate is talking or thinking: drop what's being recorded
+    if (l.rec) { l.rec.onstop = null; l.rec.stop(); l.rec = null; $("mic").classList.remove("rec"); }
+    return;
+  }
+  if (!l.rec) {
+    if (!loud) { l.floor = 0.95 * l.floor + 0.05 * level; return; }  // follow the room's noise
+    l.chunks = [];
+    l.rec = new MediaRecorder(l.stream);
+    l.rec.ondataavailable = (e) => e.data.size && l.chunks.push(e.data);
+    const rec = l.rec, chunks = l.chunks;
+    rec.onstop = () => {
+      const voiced = l.voicedMs;
+      const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
+      if (voiced >= VAD.minSpeechMs && blob.size > 2000) transcribeAndSend(blob, true);
+      else if (!busy) setState("idle");
+    };
+    rec.start();
+    Object.assign(l, { started: now, lastVoice: now, voicedMs: 0 });
+    $("mic").classList.add("rec");
+    setState("listening");
+    return;
+  }
+  if (loud) { l.lastVoice = now; l.voicedMs += VAD.frameMs; }
+  if (now - l.lastVoice > VAD.endSilenceMs || now - l.started > VAD.maxMs) {
+    l.rec.stop();
+    l.rec = null;
+    $("mic").classList.remove("rec");
+  }
+}
+
+listenToggle.addEventListener("change", () => (listenToggle.checked ? startListening() : stopListening()));
+if (listenToggle.checked) startListening();
 
 const mic = $("mic");
 mic.addEventListener("pointerdown", (e) => { e.preventDefault(); startRec(); });
