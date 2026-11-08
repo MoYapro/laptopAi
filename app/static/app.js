@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 const log = $("log"), text = $("text"), stateEl = $("state");
 const camToggle = $("camera"), speakToggle = $("speak"), quietToggle = $("quiet"), internetToggle = $("internet");
+const modelSelect = $("model");
 const listenToggle = $("listen");
 
 // Remember per-browser toggles (speak and listen default to off). Quiet is a server setting.
@@ -243,7 +244,9 @@ function connect() {
         quietToggle.checked = m.quiet;
         internetToggle.checked = !!m.internet;
         renderQuestions(m.questions || []);
-        $("model").textContent = m.model;
+        modelSelect.replaceChildren(...(m.models || [{ name: m.model, vision: true }]).map(
+          (o) => new Option(o.vision ? o.name : `${o.name} (no vision)`, o.name)));
+        modelSelect.value = m.model;
         break;
       case "state":
         setState(m.state);
@@ -282,6 +285,7 @@ function connect() {
       case "settings":
         if ("quiet" in m) quietToggle.checked = m.quiet;
         if ("internet" in m) internetToggle.checked = m.internet;
+        if ("model" in m) modelSelect.value = m.model;
         break;
       case "notice":
         addMsg("notice", m.text);
@@ -307,6 +311,7 @@ function sendTurn(msg, source, sttMs = null) {
 }
 
 quietToggle.addEventListener("change", () => send({ type: "set_quiet", quiet: quietToggle.checked }));
+modelSelect.addEventListener("change", () => send({ type: "set_model", model: modelSelect.value }));
 internetToggle.addEventListener("change", () => send({ type: "set_internet", internet: internetToggle.checked }));
 
 // ---------------------------------------------------------------- text input

@@ -194,7 +194,8 @@ class Screen:
                  "images": [frame.b64]},
             ]
             async with self.agent.lock:
-                caption = await self.agent.llm.complete(messages, max_tokens=120, temperature=0.2)
+                caption = await self.agent.llm.complete(messages, max_tokens=120, temperature=0.2,
+                                                        model=await self.agent.llm.vision_model())
             self._captions[name] = re.sub(r"\s+", " ", re.sub(r"[*#_`]+", "", caption)).strip()
             self._described[name] = frame.small
         parts = [f"{where[n].removeprefix('the ')}: {self._captions[n]}" if len(frames) > 1 else self._captions[n]

@@ -25,7 +25,10 @@ header {
   padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-#model { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#model { min-width: 0; max-width: 260px; color: var(--muted); font: inherit; font-size: 13px; background: transparent;
+  border: 1px solid transparent; border-radius: 6px; padding: 2px 4px; cursor: pointer; text-overflow: ellipsis; }
+#model:hover, #model:focus { border-color: var(--line); color: var(--text); outline: none; }
+#model option { background: var(--panel); color: var(--text); }
 .toggles { display: flex; align-items: center; gap: 14px; font-size: 14px; flex-shrink: 0; }
 .navlink { color: var(--accent); text-decoration: none; }
 .toggles label { display: flex; gap: 5px; align-items: center; cursor: pointer; }

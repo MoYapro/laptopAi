@@ -55,6 +55,12 @@ async def warm_up() -> None:
         if attempt == 0:
             log.warning("Ollama not reachable at %s yet, waiting", llm.url)
         await asyncio.sleep(2)
+    saved = db.get_setting("model", "")
+    if saved and saved != llm.model:
+        if await llm.has_model(saved):
+            llm.model = saved
+        else:
+            log.warning("chosen model %s is no longer installed, using %s", saved, llm.model)
     for name, load in [("llm", llm.load), ("tts", tts.load), ("stt", stt.load)]:
         try:
             t0 = time.perf_counter()
@@ -223,6 +229,20 @@ class Client:
             await self.ws.send_json(msg)
 
 
+async def chat_models() -> list[dict]:
+    """Installed models that can chat. Models without vision don't get the camera or screen images; the scene and
+    screen logs are then written by the configured default model."""
+    try:
+        models = [{"name": m["name"], "vision": "vision" in m["capabilities"]}
+                  for m in await llm.models() if "completion" in m["capabilities"]]
+    except Exception:
+        log.exception("listing Ollama models failed")
+        models = []
+    if llm.model not in {m["name"] for m in models}:
+        models.insert(0, {"name": llm.model, "vision": True})
+    return models
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
@@ -236,6 +256,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         "internet": agent.internet,
         "questions": agent.curiosity.public(),
         "model": llm.model,
+        "models": await chat_models(),
     })
     hub.clients.add(client)
     try:
@@ -254,6 +275,12 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 await agent.set_quiet(bool(msg.get("quiet")))
             elif kind == "set_internet":
                 await agent.set_internet(bool(msg.get("internet")))
+            elif kind == "set_model" and (model := str(msg.get("model", "")).strip()):
+                try:
+                    await agent.set_model(model)
+                except Exception as e:
+                    await client.send({"type": "error", "text": f"could not switch model: {e}"})
+                    await client.send({"type": "settings", "model": llm.model})
             elif kind == "name_face" and (name := str(msg.get("name", "")).strip()):
                 await agent.learn_name(name, track_key=str(msg.get("key", "")))
     except WebSocketDisconnect:

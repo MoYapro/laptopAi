@@ -229,6 +229,18 @@ class Agent:
         await self.hub.broadcast({"type": "settings", "quiet": quiet})
         await self.emit("setting", f"quiet mode {'on' if quiet else 'off'}")
 
+    async def set_model(self, model: str) -> None:
+        installed = {m["name"] for m in await self.llm.models()}
+        if model not in installed:
+            raise ValueError(f"model {model} is not installed")
+        if model == self.llm.model:
+            return
+        self.llm.model = model
+        self.db.set_setting("model", model)
+        await self.hub.broadcast({"type": "settings", "model": model})
+        await self.emit("setting", f"conversation model switched to {model}")
+        asyncio.create_task(self._safe(self.llm.load(), "model load"))
+
     async def emit(self, kind: str, text: str, data: dict | None = None, ts: float | None = None) -> dict:
         event = self.db.add_event(kind, text, data, ts)
         log.info("[%s] %s", kind, text)
@@ -425,7 +437,8 @@ class Agent:
                 speaker = asyncio.create_task(self._speak(speech_queue, t0, timings)) if speak else None
                 reply, pending, final = "", "", {}
                 await self.hub.broadcast({"type": "assistant_start", "source": "reply", "ts": time.time()})
-                tools = (REMINDER_TOOL_DEFS + ([SCREEN_TOOL] if self.screen.available else [])
+                sees = "vision" in await self.llm.capabilities()
+                tools = (REMINDER_TOOL_DEFS + ([SCREEN_TOOL] if self.screen.available and sees else [])
                          + ([LOOKUP_TOOL] if self.internet else []))
                 for round_ in range(config.MAX_TOOL_ROUNDS + 1):
                     tool_calls: list[dict] = []
@@ -633,7 +646,8 @@ class Agent:
             {"role": "user", "content": task, "images": images},
         ]
         async with self.lock:
-            caption = await self.llm.complete(messages, max_tokens=120, temperature=0.2)
+            caption = await self.llm.complete(messages, max_tokens=120, temperature=0.2,
+                                              model=await self.llm.vision_model())
         # The model likes "**Change:**" headings; the log should be plain sentences.
         return re.sub(r"\s+", " ", re.sub(r"[*#_`]+", "", caption)).strip()
 
