@@ -75,6 +75,10 @@ CONSOLIDATE_INTERVAL_S = _float("CONSOLIDATE_INTERVAL_S", 4 * 3600)
 CONSOLIDATE_MAX_ARCHIVE_FRACTION = _float("CONSOLIDATE_MAX_ARCHIVE_FRACTION", 0.3)
 BACKUPS_KEEP = int(_float("BACKUPS_KEEP", 10))
 
+# --- screen (screenshots from the host helper project-scripts/screen.sh, see screen.py)
+SCREEN_DESCRIBE_INTERVAL_S = _float("SCREEN_DESCRIBE_INTERVAL_S", 60)  # look this often; describe monitors that changed
+SCREEN_CHANGE_THRESHOLD = _float("SCREEN_CHANGE_THRESHOLD", 6.0)  # mean abs pixel diff (0-255) of a 64x36 thumbnail
+
 # --- initiative
 INITIATIVE_REQUIRES_FACE = _bool("INITIATIVE_REQUIRES_FACE") is not False  # never talk to an empty room
 INITIATIVE_COOLDOWN_S = _float("INITIATIVE_COOLDOWN_S", 120)

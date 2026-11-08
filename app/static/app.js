@@ -17,7 +17,7 @@ const KIND_LABELS = {
   system_start: "start", system_stop: "shutdown", unclean_shutdown: "crash",
   scene: "sees", person_arrived: "arrived", person_left: "left", person_named: "name",
   curious: "wondering", learned: "learned", consolidation: "memory review", lookup: "looked up",
-  initiative: "said", initiative_quiet: "would say", decision: "decided", memory: "memory", setting: "setting", reminder: "reminder",
+  initiative: "said", initiative_quiet: "would say", decision: "decided", memory: "memory", setting: "setting", reminder: "reminder", screen: "screen",
 };
 
 const OWN_LABELS = { initiative: "on its own", reminder: "reminder" };

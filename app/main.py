@@ -11,7 +11,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -89,6 +89,7 @@ async def lifespan(_: FastAPI):
         asyncio.create_task(startup_sequence()),
         asyncio.create_task(agent.heartbeat()),
         asyncio.create_task(agent.reminders.loop()),
+        asyncio.create_task(agent.screen.loop()),
         asyncio.create_task(consolidator.loop()),
     ]
     yield
@@ -129,6 +130,7 @@ async def status() -> dict:
         "voice": tts.voice_name,
         "quiet": agent.quiet,
         "internet": agent.internet,
+        "screen": agent.screen.available,
         "present": [t.public() for t in presence.present()],
     }
 
@@ -171,6 +173,26 @@ async def consolidate(background: bool = False) -> dict:
     """Run the memory review now (takes a while; returns its summary). background=true runs it like the idle job,
     which pauses as soon as someone is around."""
     return await consolidator.run("background" if background else "manual")
+
+
+@app.get("/api/screen/next")
+async def screen_next(wait: float = 60) -> PlainTextResponse:
+    """Long poll of the screen helper (project-scripts/screen.sh): "capture" when the app wants a screenshot."""
+    return PlainTextResponse("capture" if await agent.screen.next_request(wait) else "idle")
+
+
+@app.post("/api/screen")
+async def screen(request: Request) -> Response:
+    """One capture from the screen helper: a file per monitor, named "<monitor>@<x position>.jpg"."""
+    shots = []
+    for upload in (await request.form()).getlist("shot"):
+        name, _, x = upload.filename.rsplit(".", 1)[0].rpartition("@")
+        shots.append((name or "screen", int(x) if x.lstrip("-").isdigit() else 0, await upload.read()))
+    try:
+        await asyncio.to_thread(agent.screen.receive, shots)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return Response(status_code=204)
 
 
 @app.post("/api/transcribe")

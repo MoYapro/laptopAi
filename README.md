@@ -117,6 +117,22 @@ on the page (off by default):
 - Lookups never contain names of people from its memory. Results are marked as data, not instructions.
 - Not covered: brand-new or niche things, and live data (weather, news, prices).
 
+## Screen
+
+The app runs in a container and can't take screenshots itself, so `project-scripts/screen.sh` is a small helper on
+the desktop: it waits until the app asks, then captures each monitor (monitors from `mmsg` on mango or `swaymsg` on
+sway, left to right; `-o DP-1` for only one; otherwise one image of everything) and sends them. Needs grim and jq on
+Wayland, ImageMagick `import` on X11. Start it with the session, e.g. in mango's `autostart.sh`:
+`~/projects/laptopai/project-scripts/screen.sh >/dev/null 2>&1 &`. Without it running, Housemate knows it can't see
+the screen.
+
+- **Every minute** (`SCREEN_DESCRIBE_INTERVAL_S`) the app takes a look and describes each monitor that changed, one
+  call per monitor ("on the screen: left monitor: … | right monitor: …").
+- **When it wants:** the model has a `look_at_screen` tool for a fresh look; a message that refers to the screen
+  ("look at this", "what's on my screen", "this error") comes with fresh screenshots right away.
+- Frames stay in memory only, each monitor scaled to at most 1280 px (image tokens grow with resolution). The model is
+  told to summarize private content and never read out passwords, codes or account numbers.
+
 ## Reminders
 
 "Remind me in 20 minutes to take the pasta off" or "… at 18:30": the model calls `set_reminder` (`app/reminders.py`)

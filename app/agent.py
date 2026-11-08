@@ -21,6 +21,8 @@ from lookup import Lookup
 from reminders import NAMES as REMINDER_TOOLS
 from reminders import TOOLS as REMINDER_TOOL_DEFS
 from reminders import MENTIONS_REMINDER, Reminders, parse_args
+from screen import TOOL as SCREEN_TOOL
+from screen import Screen
 from speech import TTS
 from util import ago, clean_for_speech, fmt_dur, fmt_ts, hhmm, pop_sentence, split_sentences
 
@@ -100,10 +102,14 @@ SOURCES = {
 }
 
 
-def tag_message(content: str, source: str, sender: str | None = None, image: bool = False) -> str:
+def tag_message(content: str, source: str, sender: str | None = None, image: bool = False,
+                screens: int = 0) -> str:
     header = SOURCES.get(source, f"Message via {source}").format(sender=sender or "an unnamed developer tool")
-    if image:
-        header += ". Attached: a camera image of the room right now"
+    screen = (f"screenshots of the computer's {screens} monitors right now (left to right)" if screens > 1
+              else "a screenshot of the computer screen right now")
+    attached = [what for what, on in [("a camera image of the room right now", image), (screen, screens)] if on]
+    if attached:
+        header += ". Attached: " + " and ".join(attached)
     return f"{header}:\n{content}"
 
 
@@ -210,6 +216,7 @@ class Agent:
         self.curiosity = Curiosity(self)
         self.lookup = Lookup(db)
         self.reminders = Reminders(self)
+        self.screen = Screen(self)
 
     # ---------------------------------------------------------------- state
 
@@ -360,6 +367,7 @@ class Agent:
             lines.append("Topics in your memory (most recent first): " + ", ".join(t["name"] for t in topics) + ".")
         lines += self.curiosity.context_lines()
         lines += self.reminders.context_lines()
+        lines += self.screen.context_lines()
         lines.append(
             "Internet lookups: available (look_up tool)." if self.internet
             else "Internet lookups: switched off; you can't look anything up right now."
@@ -397,9 +405,15 @@ class Agent:
                 {"type": "user", "text": text, "source": source, "sender": sender, "ts": time.time()}
             )
             await self.hub.broadcast({"type": "state", "state": "thinking"})
-            user_msg: dict = {"role": "user", "content": tag_message(text, source, sender, image=bool(image_jpg))}
-            if image_jpg:
-                user_msg["images"] = [base64.b64encode(image_jpg).decode()]
+            screen_imgs = await self.screen.images_for(text)
+            user_msg: dict = {"role": "user", "content": tag_message(text, source, sender, image=bool(image_jpg),
+                                                                     screens=len(screen_imgs))}
+            images = [base64.b64encode(image_jpg).decode()] if image_jpg else []
+            if screen_imgs:
+                images += screen_imgs
+                timings["screen"] = len(screen_imgs)
+            if images:
+                user_msg["images"] = images
 
             async with self.lock:
                 timings["queue_ms"] = ms()
@@ -411,7 +425,8 @@ class Agent:
                 speaker = asyncio.create_task(self._speak(speech_queue, t0, timings)) if speak else None
                 reply, pending, final = "", "", {}
                 await self.hub.broadcast({"type": "assistant_start", "source": "reply", "ts": time.time()})
-                tools = REMINDER_TOOL_DEFS + ([LOOKUP_TOOL] if self.internet else [])
+                tools = (REMINDER_TOOL_DEFS + ([SCREEN_TOOL] if self.screen.available else [])
+                         + ([LOOKUP_TOOL] if self.internet else []))
                 for round_ in range(config.MAX_TOOL_ROUNDS + 1):
                     tool_calls: list[dict] = []
                     offer = tools if round_ < config.MAX_TOOL_ROUNDS else None  # last round: answer, no more tools
@@ -434,19 +449,30 @@ class Agent:
                             final = chunk
                     if not tool_calls:
                         break
-                    if reply.strip():  # it already answered ("Sure, I'll remind you"): just carry out the calls
+                    called = {c.get("function", {}).get("name") for c in tool_calls}
+                    if reply.strip() and called <= REMINDER_TOOLS:
+                        # It already answered ("Sure, I'll remind you"): just carry out the calls.
                         for call in tool_calls[:2]:
                             await self.run_tool(call)
                         break
-                    # Run the tools, hand back the results, let it answer.
-                    looking_up = any(c.get("function", {}).get("name") == "look_up" for c in tool_calls)
-                    await self.hub.broadcast({"type": "state", "state": "looking up" if looking_up else "thinking"})
+                    # Run the tools, hand back the results, let it answer (or go on: "Let me look. …").
+                    state = "looking up" if "look_up" in called else "looking" if "look_at_screen" in called else "thinking"
+                    await self.hub.broadcast({"type": "state", "state": state})
                     t_tool = time.perf_counter()
-                    messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+                    messages.append({"role": "assistant", "content": reply, "tool_calls": tool_calls})
+                    seen: list[str] = []
                     for call in tool_calls[:2]:
                         result = await self.run_tool(call)
+                        seen += result.pop("_images", [])
                         messages.append({"role": "tool", "tool_name": call.get("function", {}).get("name", ""),
                                          "content": json.dumps(result, ensure_ascii=False)})
+                    if seen:  # images can't go into a tool result; they follow as their own message
+                        messages.append({"role": "user", "images": seen, "content": (
+                            "[Internal, not said by anyone: the screenshots from look_at_screen, left to right.]")})
+                        timings["screen"] = len(seen)
+                    if reply.strip():
+                        reply += " "
+                        await self.hub.broadcast({"type": "token", "text": " "})
                     timings["lookup_ms"] = timings.get("lookup_ms", 0) + round((time.perf_counter() - t_tool) * 1000)
 
             timings["llm_ms"] = ms()
@@ -487,6 +513,8 @@ class Agent:
     async def run_tool(self, call: dict) -> dict:
         fn = call.get("function", {})
         args = parse_args(call)
+        if fn.get("name") == "look_at_screen":
+            return await self.screen.look()
         if fn.get("name") in REMINDER_TOOLS:
             return await self.reminders.run_tool(fn["name"], args)
         if fn.get("name") != "look_up" or not self.internet:
