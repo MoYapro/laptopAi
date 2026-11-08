@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS notes (
     status TEXT NOT NULL DEFAULT 'new'  -- new | kept
 );
 
+-- reminders set by the conversation model (see reminders.py)
+CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, due REAL NOT NULL, text TEXT NOT NULL, who TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | done | cancelled | missed | failed
+    done_ts REAL
+);
+
 -- internet lookups (cache + record of where facts came from)
 CREATE TABLE IF NOT EXISTS lookups (
     term TEXT PRIMARY KEY COLLATE NOCASE, ts REAL NOT NULL, result TEXT NOT NULL
@@ -260,6 +267,23 @@ class DB:
             return False
         self._insert("INSERT INTO memories (ts, person_id, text) VALUES (?, ?, ?)", (time.time(), pid, text))
         return True
+
+    # --------------------------------------------------------------- reminders
+
+    def add_reminder(self, due: float, text: str, who: str | None) -> int:
+        return self._insert("INSERT INTO reminders (ts, due, text, who) VALUES (?, ?, ?, ?)", (time.time(), due, text, who))
+
+    def reminder(self, rid: int) -> dict | None:
+        rows = self._q("SELECT * FROM reminders WHERE id = ?", (rid,))
+        return dict(rows[0]) if rows else None
+
+    def pending_reminders(self, due_before: float | None = None) -> list[dict]:
+        rows = self._q("SELECT * FROM reminders WHERE status = 'pending' AND due <= ? ORDER BY due",
+                       (due_before if due_before is not None else float("inf"),))
+        return [dict(r) for r in rows]
+
+    def set_reminder_status(self, rid: int, status: str) -> None:
+        self._q("UPDATE reminders SET status = ?, done_ts = ? WHERE id = ?", (status, time.time(), rid))
 
     # -------------------------------------------------------- short-term notes
 

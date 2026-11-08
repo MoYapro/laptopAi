@@ -27,8 +27,9 @@ browser (localhost:8080)                app container (CPU)                     
   known person and bring up what it remembers, ask a stranger's name, comment on what it sees). Hard limits in code:
   only when a face is in view, not during a conversation, cooldown, max per hour.
   **Quiet mode** (on by default) still runs the decision but only logs what it *would* have said.
-- **Curiosity**: every 5 minutes (if new things happened) it reflects on recent scenes, stores lasting
-  observations ("A cat lives here.") and writes down questions ("What's the cat's name?"), shown under
+- **Curiosity**: every 5 minutes (if new things happened) it reflects on recent scenes, notes observations
+  ("A cat lives here.") in short-term memory (the memory review keeps only what recurs hours apart; the rest is
+  forgotten after 48 h) and writes down questions ("What's the cat's name?"), shown under
   *Wondering about*. When someone is in view and it's been quiet for 5 minutes, it may ask one. Answers are picked up
   from the conversation; an answer is only accepted if its content actually appears in what the person said.
   Each question is asked at most twice, at least 6 h apart.
@@ -116,16 +117,27 @@ on the page (off by default):
 - Lookups never contain names of people from its memory. Results are marked as data, not instructions.
 - Not covered: brand-new or niche things, and live data (weather, news, prices).
 
+## Reminders
+
+"Remind me in 20 minutes to take the pasta off" or "… at 18:30": the model calls `set_reminder` (`app/reminders.py`)
+with a delay or a clock time; the code computes the due time. When it's due, the model phrases it for the moment and
+it is **always spoken**, also to an empty room and in quiet mode. Pending reminders are in the model's situation, so
+"cancel the pasta reminder" works (`cancel_reminder`). They are stored in the database and survive restarts; one more
+than 6 h overdue (system was off) is logged as missed instead. If the small model answers "Okay, I'll remind you"
+without calling the tool, a second, JSON-constrained call picks the request up.
+
 ## Memory review (consolidation)
 
 A background job with a bigger model organizes what Housemate knows (`app/consolidation.py`):
 
-- **When:** nobody in view and no chat for 30 min, at most every 4 h, only if something new happened. Or now:
-  `project-scripts/consolidate.sh`, or **Review now** on the memory page (`/memory`).
+- **When:** nobody in view and no chat for 30 min, at most every 4 h, only if something new happened. A background
+  run gives way as soon as someone shows up (the running model call is cancelled) and continues in the next quiet
+  period. Or now, to the end: `project-scripts/consolidate.sh`, or **Review now** on the memory page (`/memory`).
 - **Model:** the first available of `MEMORY_MODEL` (default `qwen3.5-9b-uncensored,qwen3.5:9b`). On the laptop
   `start.sh` sets `MEMORY_NUM_GPU=0`, so it runs on CPU/RAM and the conversation model keeps the 4 GB GPU.
 - **Steps:** backup to `data/backups/` → catch up on conversations (facts missed after replies, which topics were
-  discussed with whom; developer-tool exchanges are skipped) → fix facts (merge duplicates, attach to the right
+  discussed with whom; developer-tool exchanges are skipped) → turn camera notes seen on separate occasions (6 h+
+  apart) into facts → fix facts (merge duplicates, attach to the right
   person, archive trivial/outdated) → sort facts into topics, merge duplicate topics, write profiles → link related topics.
 - **Guards in code** (the 9B model doesn't follow these reliably on its own): facts about a moment are skipped, a
   fact starting with a known name belongs to that person, person facts never move to "household", only

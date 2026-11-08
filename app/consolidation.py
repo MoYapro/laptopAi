@@ -606,7 +606,7 @@ class Consolidator:
     @staticmethod
     def _format_message(m: dict) -> str:  # noqa: C901
         if m["role"] == "assistant":
-            who = "Housemate" + (" (on its own)" if m["source"] == "initiative" else "")
+            who = "Housemate" + {"initiative": " (on its own)", "reminder": " (reminder)"}.get(m["source"], "")
         elif m["source"] == "developer":
             who = f"{m['sender'] or 'a developer tool'} (developer tool)"
         else:

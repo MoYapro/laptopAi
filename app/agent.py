@@ -18,6 +18,9 @@ from faces import Presence, Track
 from llm import Ollama
 from lookup import TOOL as LOOKUP_TOOL
 from lookup import Lookup
+from reminders import NAMES as REMINDER_TOOLS
+from reminders import TOOLS as REMINDER_TOOL_DEFS
+from reminders import MENTIONS_REMINDER, Reminders, parse_args
 from speech import TTS
 from util import ago, clean_for_speech, fmt_dur, fmt_ts, hhmm, pop_sentence, split_sentences
 
@@ -206,6 +209,7 @@ class Agent:
         self.claimed: tuple[int, float] | None = None  # (person_id, ts) of a name said in conversation
         self.curiosity = Curiosity(self)
         self.lookup = Lookup(db)
+        self.reminders = Reminders(self)
 
     # ---------------------------------------------------------------- state
 
@@ -239,6 +243,14 @@ class Agent:
 
     def present_names(self) -> list[str]:
         return [t.name for t in self.presence.present() if t.name]
+
+    def talking_to(self) -> list[str]:
+        """Known people in view, else the name someone gave in the last half hour."""
+        if names := self.present_names():
+            return names
+        if self.claimed and time.time() - self.claimed[1] < 1800:
+            return [self.db.person(self.claimed[0])["name"]]
+        return []
 
     # -------------------------------------------------------------- context
 
@@ -347,6 +359,7 @@ class Agent:
         if topics := self.db.topics()[:6]:
             lines.append("Topics in your memory (most recent first): " + ", ".join(t["name"] for t in topics) + ".")
         lines += self.curiosity.context_lines()
+        lines += self.reminders.context_lines()
         lines.append(
             "Internet lookups: available (look_up tool)." if self.internet
             else "Internet lookups: switched off; you can't look anything up right now."
@@ -372,7 +385,7 @@ class Agent:
     async def reply(
         self, text: str, source: str, image_jpg: bytes | None, speak: bool, stt_ms, sender: str | None = None
     ) -> None:
-        t0 = time.perf_counter()
+        t0, started = time.perf_counter(), time.time()
         ms = lambda: round((time.perf_counter() - t0) * 1000)  # noqa: E731
         timings: dict = {"stt_ms": stt_ms}
         names = self.present_names()
@@ -398,7 +411,7 @@ class Agent:
                 speaker = asyncio.create_task(self._speak(speech_queue, t0, timings)) if speak else None
                 reply, pending, final = "", "", {}
                 await self.hub.broadcast({"type": "assistant_start", "source": "reply", "ts": time.time()})
-                tools = [LOOKUP_TOOL] if self.internet else None
+                tools = REMINDER_TOOL_DEFS + ([LOOKUP_TOOL] if self.internet else [])
                 for round_ in range(config.MAX_TOOL_ROUNDS + 1):
                     tool_calls: list[dict] = []
                     offer = tools if round_ < config.MAX_TOOL_ROUNDS else None  # last round: answer, no more tools
@@ -419,10 +432,15 @@ class Agent:
                                     pending = sentence[1]
                         if chunk.get("done"):
                             final = chunk
-                    if not tool_calls or reply.strip():
+                    if not tool_calls:
                         break
-                    # The model wants to look something up: run it, hand back the result, let it answer.
-                    await self.hub.broadcast({"type": "state", "state": "looking up"})
+                    if reply.strip():  # it already answered ("Sure, I'll remind you"): just carry out the calls
+                        for call in tool_calls[:2]:
+                            await self.run_tool(call)
+                        break
+                    # Run the tools, hand back the results, let it answer.
+                    looking_up = any(c.get("function", {}).get("name") == "look_up" for c in tool_calls)
+                    await self.hub.broadcast({"type": "state", "state": "looking up" if looking_up else "thinking"})
                     t_tool = time.perf_counter()
                     messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
                     for call in tool_calls[:2]:
@@ -451,6 +469,8 @@ class Agent:
             self.user_busy = False
             await self.hub.broadcast({"type": "state", "state": "idle"})
 
+        if MENTIONS_REMINDER.search(f"{text}\n{reply}") and self.reminders.last_call < started:
+            await self._safe(self.reminders.catch_missed(text, reply), "reminder check")
         asyncio.create_task(self._safe(self.extract_memories(text, reply, source, sender), "memory extraction"))
 
     # ---------------------------------------------------------------- tools
@@ -466,12 +486,9 @@ class Agent:
 
     async def run_tool(self, call: dict) -> dict:
         fn = call.get("function", {})
-        args = fn.get("arguments") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
+        args = parse_args(call)
+        if fn.get("name") in REMINDER_TOOLS:
+            return await self.reminders.run_tool(fn["name"], args)
         if fn.get("name") != "look_up" or not self.internet:
             return {"found": False, "reason": "this tool is not available"}
         term = str(args.get("term", "")).strip()

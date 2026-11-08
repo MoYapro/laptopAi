@@ -17,8 +17,10 @@ const KIND_LABELS = {
   system_start: "start", system_stop: "shutdown", unclean_shutdown: "crash",
   scene: "sees", person_arrived: "arrived", person_left: "left", person_named: "name",
   curious: "wondering", learned: "learned", consolidation: "memory review", lookup: "looked up",
-  initiative: "said", initiative_quiet: "would say", decision: "decided", memory: "memory", setting: "setting",
+  initiative: "said", initiative_quiet: "would say", decision: "decided", memory: "memory", setting: "setting", reminder: "reminder",
 };
+
+const OWN_LABELS = { initiative: "on its own", reminder: "reminder" };
 
 function setState(s) {
   stateEl.textContent = s;
@@ -82,7 +84,7 @@ function addUserMsg(text, source, sender, ts) {
 
 function renderMessage(m) {
   if (m.role === "user") addUserMsg(m.content, m.source, m.sender, m.ts);
-  else if (m.source === "initiative") addMsg("own", m.content, "on its own", m.ts);
+  else if (OWN_LABELS[m.source]) addMsg("own", m.content, OWN_LABELS[m.source], m.ts);
   else addMsg("bot", m.content, null, m.ts);
 }
 
@@ -254,7 +256,7 @@ function connect() {
         log.scrollTop = log.scrollHeight;
         break;
       case "assistant":
-        addMsg(m.source === "initiative" ? "own" : "bot", m.text, m.source === "initiative" ? "on its own" : null, m.ts);
+        addMsg(OWN_LABELS[m.source] ? "own" : "bot", m.text, OWN_LABELS[m.source] || null, m.ts);
         break;
       case "audio":
         enqueueWav(m.wav);

@@ -88,6 +88,7 @@ async def lifespan(_: FastAPI):
     tasks = [
         asyncio.create_task(startup_sequence()),
         asyncio.create_task(agent.heartbeat()),
+        asyncio.create_task(agent.reminders.loop()),
         asyncio.create_task(consolidator.loop()),
     ]
     yield
