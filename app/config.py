@@ -79,6 +79,12 @@ INITIATIVE_COOLDOWN_S = _float("INITIATIVE_COOLDOWN_S", 120)
 INITIATIVE_MAX_PER_HOUR = int(_float("INITIATIVE_MAX_PER_HOUR", 6))
 GREET_AFTER_ABSENCE_S = _float("GREET_AFTER_ABSENCE_S", 1800)  # arrivals after this long bypass the cooldown
 CONVERSATION_ACTIVE_S = _float("CONVERSATION_ACTIVE_S", 45)  # no unprompted remarks while someone is chatting
+# --- internet lookups (look_up tool; off until switched on on the page)
+LOOKUP_CACHE_DAYS = _float("LOOKUP_CACHE_DAYS", 7)
+LOOKUP_CONTACT = os.environ.get("LOOKUP_CONTACT", "").strip()  # email or URL; enables the Wikipedia fallback
+INTERNET_DEFAULT = _bool("INTERNET_DEFAULT") is True
+MAX_TOOL_ROUNDS = 2
+
 # --- curiosity
 REFLECT_INTERVAL_S = _float("REFLECT_INTERVAL_S", 300)  # turn recent scenes into observations + questions
 CURIOSITY_IDLE_S = _float("CURIOSITY_IDLE_S", 300)  # quiet this long with someone in view → maybe ask something

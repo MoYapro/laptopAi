@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const log = $("log"), text = $("text"), stateEl = $("state");
-const camToggle = $("camera"), speakToggle = $("speak"), quietToggle = $("quiet");
+const camToggle = $("camera"), speakToggle = $("speak"), quietToggle = $("quiet"), internetToggle = $("internet");
 
 // Remember per-browser toggles (speak defaults to off). Quiet is a server setting.
 for (const el of [camToggle, speakToggle]) {
@@ -16,7 +16,7 @@ for (const el of [camToggle, speakToggle]) {
 const KIND_LABELS = {
   system_start: "start", system_stop: "shutdown", unclean_shutdown: "crash",
   scene: "sees", person_arrived: "arrived", person_left: "left", person_named: "name",
-  curious: "wondering", learned: "learned", consolidation: "memory review",
+  curious: "wondering", learned: "learned", consolidation: "memory review", lookup: "looked up",
   initiative: "said", initiative_quiet: "would say", decision: "decided", memory: "memory", setting: "setting",
 };
 
@@ -234,6 +234,7 @@ function connect() {
         people = m.people;
         renderPeople();
         quietToggle.checked = m.quiet;
+        internetToggle.checked = !!m.internet;
         renderQuestions(m.questions || []);
         $("model").textContent = m.model;
         break;
@@ -278,7 +279,8 @@ function connect() {
         renderQuestions(m.questions);
         break;
       case "settings":
-        quietToggle.checked = m.quiet;
+        if ("quiet" in m) quietToggle.checked = m.quiet;
+        if ("internet" in m) internetToggle.checked = m.internet;
         break;
       case "notice":
         addMsg("notice", m.text);
@@ -304,6 +306,7 @@ function sendTurn(msg, source, sttMs = null) {
 }
 
 quietToggle.addEventListener("change", () => send({ type: "set_quiet", quiet: quietToggle.checked }));
+internetToggle.addEventListener("change", () => send({ type: "set_internet", internet: internetToggle.checked }));
 
 // ---------------------------------------------------------------- text input
 $("composer").addEventListener("submit", (e) => {

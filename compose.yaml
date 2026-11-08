@@ -29,6 +29,7 @@ services:
       LLM_THINK: ${LLM_THINK:-false}   # thinking adds seconds of silence before every reply
       MEMORY_MODEL: ${MEMORY_MODEL:-qwen3.5-9b-uncensored,qwen3.5:9b}   # first available is used
       MEMORY_NUM_GPU: ${MEMORY_NUM_GPU:--1}   # 0 = run the memory model on CPU (laptop)
+      LOOKUP_CONTACT: ${LOOKUP_CONTACT:-}   # email or URL for Wikimedia's user-agent policy; enables the Wikipedia fallback
       WHISPER_MODEL: ${WHISPER_MODEL:-small}
       WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
       PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}

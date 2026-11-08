@@ -127,6 +127,7 @@ async def status() -> dict:
         "whisper": stt.model_name,
         "voice": tts.voice_name,
         "quiet": agent.quiet,
+        "internet": agent.internet,
         "present": [t.public() for t in presence.present()],
     }
 
@@ -196,6 +197,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         "events": db.recent_events(80),
         "people": [t.public() for t in presence.present()],
         "quiet": agent.quiet,
+        "internet": agent.internet,
         "questions": agent.curiosity.public(),
         "model": llm.model,
     })
@@ -214,6 +216,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 asyncio.create_task(_run_turn(text, msg, image))
             elif kind == "set_quiet":
                 await agent.set_quiet(bool(msg.get("quiet")))
+            elif kind == "set_internet":
+                await agent.set_internet(bool(msg.get("internet")))
             elif kind == "name_face" and (name := str(msg.get("name", "")).strip()):
                 await agent.learn_name(name, track_key=str(msg.get("key", "")))
     except WebSocketDisconnect:

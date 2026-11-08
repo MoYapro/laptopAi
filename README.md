@@ -102,6 +102,20 @@ insisting on something false, delete those rows from the `messages` table in `da
 | `CURIOSITY_IDLE_S` | 300 | quiet this long with someone in view → it may ask one of its questions |
 | `QUESTION_REASK_S` / `QUESTION_MAX_ASKS` | 21600 / 2 | don't re-ask a question sooner / more often than this |
 
+## Internet lookups
+
+Housemate can look up short facts with a `look_up` tool (`app/lookup.py`), only while **internet** is switched on
+on the page (off by default):
+
+- DuckDuckGo's Instant Answer API (official, no key), plus a Wikipedia fallback when `LOOKUP_CONTACT` (an email or
+  URL for Wikimedia's user-agent policy) is set.
+- Results are 1-2 sentences with a `source` field. Housemate uses the source only when asked or when it matters;
+  every lookup is in the timeline with its source, so it can answer "where did you get that?" later.
+- A relevance check drops articles whose title doesn't match the term (Wikipedia's search always returns *something*),
+  and too-long terms are retried shorter. Misses aren't cached; hits are cached for 7 days.
+- Lookups never contain names of people from its memory. Results are marked as data, not instructions.
+- Not covered: brand-new or niche things, and live data (weather, news, prices).
+
 ## Memory review (consolidation)
 
 A background job with a bigger model organizes what Housemate knows (`app/consolidation.py`):

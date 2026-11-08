@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS questions (
     answer TEXT, answered_ts REAL
 );
 
+-- internet lookups (cache + record of where facts came from)
+CREATE TABLE IF NOT EXISTS lookups (
+    term TEXT PRIMARY KEY COLLATE NOCASE, ts REAL NOT NULL, result TEXT NOT NULL
+);
+
 -- organized knowledge (built by the consolidation job, see consolidation.py)
 CREATE TABLE IF NOT EXISTS topics (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, summary TEXT NOT NULL DEFAULT '',
@@ -381,6 +386,19 @@ class DB:
         with self._lock:
             self._conn.backup(dest)
         dest.close()
+
+    # ------------------------------------------------------------ lookups
+
+    def cached_lookup(self, term: str, not_before: float) -> dict | None:
+        rows = self._q("SELECT result FROM lookups WHERE term = ? AND ts >= ?", (term, not_before))
+        return json.loads(rows[0]["result"]) if rows else None
+
+    def store_lookup(self, term: str, result: dict) -> None:
+        self._q(
+            "INSERT INTO lookups (term, ts, result) VALUES (?, ?, ?) "
+            "ON CONFLICT (term) DO UPDATE SET ts = excluded.ts, result = excluded.result",
+            (term, time.time(), json.dumps(result)),
+        )
 
     # ---------------------------------------------------------- questions
 

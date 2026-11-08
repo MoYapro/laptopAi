@@ -24,9 +24,14 @@ class Ollama:
             body["keep_alive"] = keep_alive
         return body
 
-    async def chat(self, messages: list[dict], temperature: float | None = None) -> AsyncIterator[dict]:
-        """Yields Ollama's NDJSON chunks; the last one has done=True and timing stats."""
+    async def chat(
+        self, messages: list[dict], temperature: float | None = None, tools: list[dict] | None = None
+    ) -> AsyncIterator[dict]:
+        """Yields Ollama's NDJSON chunks; the last one has done=True and timing stats.
+        With tools, a chunk may carry message.tool_calls instead of content."""
         body = self._body(messages, None, None, True, {"temperature": temperature}, None)
+        if tools:
+            body["tools"] = tools
         async with self._client.stream("POST", f"{self.url}/api/chat", json=body) as resp:
             if resp.status_code != 200:
                 detail = (await resp.aread()).decode(errors="replace")
