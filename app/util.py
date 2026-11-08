@@ -72,7 +72,8 @@ def word_similarity(a: str, b: str) -> float:
 # A fact about a single moment is no memory: what someone wears or does right now, what just appeared.
 # Habits ("Tom often wears headphones") and projects ("Tom is converting his laptop") don't match.
 MOMENTARY = re.compile(
-    r"\b(currently|right now|at the moment|just now|today|has (just )?appeared|was wearing"
+    r"\b(currently|right now|at the moment|just now|today|has (just )?appeared|was wearing|is now|remains?|remained"
+    r"|has (just )?(joined|moved|left|found|arrived|settled)"
     r"|is (wearing|sitting|resting|holding|drinking|eating|lying|standing|leaning|playing))\b",
     re.I,
 )

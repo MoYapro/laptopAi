@@ -1,7 +1,9 @@
 """Curiosity: learn about the surroundings instead of just watching them.
 
-- reflect():  every few minutes, turn recent scene descriptions into lasting observations
-              ("A cat lives here.") and open questions ("What's the cat's name?").
+- reflect():  every few minutes, turn recent scene descriptions into observations ("A cat lives here.") and
+              open questions ("What's the cat's name?"). Observations are short-term notes: single camera
+              images are often momentary or misread, so only the memory review (consolidation.py) turns notes
+              that recur at different times into lasting facts; the rest expire.
 - maybe_ask(): when someone is in view and it has been quiet for a while, give the initiative
               step a chance to ask one of those questions.
 - answers are picked up by the agent's memory extraction after each reply (see Agent.extract_memories).
@@ -37,7 +39,7 @@ What you already know about this place: {known}
 Questions you already have or asked before: {questions}
 
 Return JSON:
-- observations: up to 3 lasting facts about this place, its things or the habits of the people in it that you can reasonably conclude from what you saw, as short sentences (e.g. "A cat lives here.", "There is a sim-racing steering wheel at the desk.", "Tom often wears a headset at the desk."). Not momentary things like someone touching their face. Nothing you already know. Often empty.
+- observations: up to 3 lasting facts about this place, its things or the habits of the people in it that you can reasonably conclude from what you saw, as short sentences (e.g. "A cat lives here.", "There is a sim-racing steering wheel at the desk.", "Tom often wears a headset at the desk."). Not momentary things (someone sitting, looking down, touching their face, a thing that moved), not guesses about visitors or what didn't happen. Nothing you already know. Often empty.
 - questions: up to 2 short, friendly questions you would genuinely like to ask the people here to understand your surroundings and their lives better (e.g. "What's the cat's name?", "What do you use the steering wheel for?"). Only things a person in the room could answer. Not ones you already have or know. Often empty."""
 
 
@@ -124,10 +126,14 @@ class Curiosity:
         self.reflected_until = events[-1]["ts"]
         self.db.set_setting("reflected_until", str(self.reflected_until))
 
+        # Repeats of a note at different times are what the memory review needs as evidence, so known notes
+        # are only skipped when they were noted in the last half hour.
+        recent = [n["text"] for n in self.db.notes(since=time.time() - 1800)]
         for obs in [o.strip() for o in result.get("observations", [])][:3]:
-            if obs and not any(word_similarity(obs, k) >= 0.6 for k in known) and self.db.add_memory(obs, None):
-                known.append(obs)
-                await self.agent.emit("memory", f"noticed: {obs}")
+            if (obs and not any(word_similarity(obs, k) >= 0.6 for k in known + recent)
+                    and self.db.add_note(obs)):
+                recent.append(obs)
+                await self.agent.emit("memory", f"noticed (short-term note): {obs}")
 
         added = False
         for text in [q.strip() for q in result.get("questions", [])][:2]:

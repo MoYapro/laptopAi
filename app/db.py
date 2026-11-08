@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS questions (
     answer TEXT, answered_ts REAL
 );
 
+-- short-term memory: what the camera reflection noticed; the memory review keeps what recurs (see consolidation.py)
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY, ts REAL NOT NULL, text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new'  -- new | kept
+);
+
 -- internet lookups (cache + record of where facts came from)
 CREATE TABLE IF NOT EXISTS lookups (
     term TEXT PRIMARY KEY COLLATE NOCASE, ts REAL NOT NULL, result TEXT NOT NULL
@@ -186,7 +192,7 @@ class DB:
     # ------------------------------------------------------------- people
 
     def person_by_name(self, name: str) -> dict | None:
-        rows = self._q("SELECT * FROM people WHERE name = ?", (name.strip(),))
+        rows = self._q("SELECT * FROM people WHERE name = ? COLLATE NOCASE", (name.strip(),))
         return dict(rows[0]) if rows else None
 
     def person(self, pid: int) -> dict | None:
@@ -254,6 +260,31 @@ class DB:
             return False
         self._insert("INSERT INTO memories (ts, person_id, text) VALUES (?, ?, ?)", (time.time(), pid, text))
         return True
+
+    # -------------------------------------------------------- short-term notes
+
+    def add_note(self, text: str) -> bool:
+        text = text.strip()
+        if not text or is_momentary(text):
+            return False
+        self._insert("INSERT INTO notes (ts, text) VALUES (?, ?)", (time.time(), text))
+        return True
+
+    def notes(self, since: float = 0, limit: int = 80) -> list[dict]:
+        """Notes not yet kept as memories, oldest first."""
+        rows = self._q("SELECT id, ts, text FROM notes WHERE status = 'new' AND ts > ? ORDER BY ts DESC LIMIT ?",
+                       (since, limit))
+        return [dict(r) for r in reversed(rows)]
+
+    def note_count_since(self, ts: float) -> int:
+        return self._q("SELECT COUNT(*) AS n FROM notes WHERE ts > ?", (ts,))[0]["n"]
+
+    def keep_notes(self, ids: list[int]) -> None:
+        self._q(f"UPDATE notes SET status = 'kept' WHERE id IN ({','.join('?' * len(ids))})", ids)
+
+    def expire_notes(self, before: float) -> int:
+        with self._lock:
+            return self._conn.execute("DELETE FROM notes WHERE status = 'new' AND ts < ?", (before,)).rowcount
 
     def memory_text(self, mid: int) -> str:
         rows = self._q("SELECT text FROM memories WHERE id = ?", (mid,))

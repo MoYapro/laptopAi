@@ -158,6 +158,7 @@ async def memory() -> dict:
         "people": people,
         "topics": db.topics(),
         "household": db.memories(None, 200),
+        "notes": db.notes(),
         "questions": agent.curiosity.public(),
         "last_review": float(db.get_setting("consolidated_at", "0")) or None,
         "review_running": consolidator.running,

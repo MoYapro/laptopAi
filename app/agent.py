@@ -340,6 +340,9 @@ class Agent:
 
         if household := select_facts(self.db.memories(None, 500), qwords, limit=8, newest=3, shown=shown):
             lines.append("What you know about this place: " + "; ".join(fact_text(f["text"]) for f in household))
+        # Short-term notes from the camera reflection (the memory review keeps what recurs).
+        if notes := select_facts(self.db.notes(since=now - 12 * 3600), qwords, limit=4, newest=2, shown=shown):
+            lines.append("Noticed on camera lately (not sure yet): " + "; ".join(fact_text(n["text"]) for n in notes))
         lines += self.related_memory(qwords, shown)
         if topics := self.db.topics()[:6]:
             lines.append("Topics in your memory (most recent first): " + ", ".join(t["name"] for t in topics) + ".")
@@ -655,9 +658,10 @@ Return JSON:
             about, fact = item.get("about", "").strip(), item.get("fact", "").strip()
             if not fact:
                 continue
-            pid = None
-            if about and about.lower() not in ("household", "unknown", "user", "the user"):
-                pid = self.db.get_or_create_person(about)["id"]
+            # Only people met in the room get an entry (via their name and face); facts about anyone or
+            # anything else ("Luna the cat", a friend who was mentioned) are household facts.
+            person = self.db.person_by_name(about) if about else None
+            pid = person["id"] if person else None
             if self.db.add_memory(fact, pid):
                 await self.emit("memory", f"remembered{f' about {about}' if pid else ''}: {fact}")
 

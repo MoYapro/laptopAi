@@ -4,7 +4,8 @@ Runs when the room has been quiet for a while (or on demand via POST /api/consol
   0. back up the database (data/backups/, last BACKUPS_KEEP kept)
   1. catch up: read conversations since the last run, add facts the per-reply extraction missed and
      note which topics were discussed with whom
-  2. reorganize: drop facts about a single moment (code), then separate small model calls: merge duplicate
+  2. notes: turn short-term camera notes that recur at different times into facts; expire old notes
+  3. reorganize: drop facts about a single moment (code), then separate small model calls: merge duplicate
      or contradicting pairs, correct facts (wrong person, Housemate mixed up with a person),
      sort facts into topics (merging duplicate topics), write person profiles, link related topics
 Every change is reversible: edited/removed facts are archived (memories.archived_ts / replaced_by), not deleted.
@@ -49,6 +50,11 @@ this that these those he she they his her their him them who which what when whe
 def content_words(text: str) -> set[str]:
     return {w.rstrip("s") for w in re.findall(r"[a-z]+", text.lower()) if len(w) > 2 and w not in FILLER_WORDS}
 DUPLICATE_SIMILARITY = 0.6  # a "new" fact this close to a stored one is a duplicate
+NOTES_KEEP_S = 48 * 3600  # short-term notes nobody confirmed are forgotten after this
+# A note becomes a fact only when seen on separate occasions this far apart: while a scene stays the same, the
+# reflection keeps paraphrasing it (and its misreadings) every few minutes, which is no evidence.
+NOTE_MIN_SPAN_S = 6 * 3600
+NOTE_GROUP_SIMILARITY = 0.5
 
 
 def fits(text: str, longest: int) -> bool:
@@ -88,6 +94,29 @@ CATCHUP_SCHEMA = {
         },
     },
     "required": ["facts", "topics"],
+}
+
+NOTES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "groups": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {  # keys are written alphabetically: the verdict comes before the fact
+                    "a_group": {"type": "integer"},
+                    "b_shared": {"type": "string"},
+                    "c_remembered": {"type": "string"},
+                    "d_verdict": {"type": "string", "enum": ["lasting", "moment", "different", "already_remembered"]},
+                    "e_fact": {"type": "string"},
+                    "f_about": {"type": "string"},
+                },
+                "required": ["a_group", "b_shared", "c_remembered", "d_verdict", "e_fact", "f_about"],
+            },
+        },
+    },
+    "required": ["groups"],
 }
 
 FACTS_SCHEMA = {
@@ -210,6 +239,31 @@ Return JSON:
 - facts: at most 8 durable facts from these conversations that are NOT already remembered (interests, projects, plans, preferences, relationships, important events, things and animals in the home). "about" is the name of the known person the fact is about, or "household" for the place, animals or anyone else; "fact" is one short third-person sentence with names. Only use what people in the room said; developer tool messages are just context. Skip anything about a single moment (what someone is wearing or doing right now). Often empty.
 - topics: the topics that were actually talked about, with the names of the known people who talked about them ("people" may be empty). Reuse an existing topic name when it fits; otherwise a short general name like "Sim racing" or "Luna the cat"."""
 
+NOTES_PROMPT = """Housemate notes what it sees on its webcam. Notes are short-term: a single camera image is often
+a passing moment or misread. Each group below holds notes about a similar thing, made on separate occasions hours apart.
+
+{groups}
+
+People Housemate knows: {people}
+Facts already remembered:
+{known}
+
+For each group return:
+- a_group: its number
+- b_shared: what all its notes show, in a few words
+- c_remembered: the remembered fact that already says this, copied, or "none"
+- d_verdict, e_fact, f_about:
+- "lasting": the notes show the same lasting thing again: an animal or object that belongs to the home, how the
+  room is used, a habit of a person. e_fact: one short sentence with names, no times; f_about: the known person it is
+  about, or "household".
+- "moment": a passing moment (someone sitting, looking down, a thing that moved), a guess about visitors, or something
+  that didn't happen.
+- "different": the notes don't show the same thing, or contradict each other.
+- "already_remembered": c_remembered is not "none".
+For anything but "lasting", e_fact and f_about are empty strings.
+
+"""
+
 FACTS_PROMPT = """All facts Housemate remembers (#id [about] text):
 {facts}
 
@@ -305,7 +359,8 @@ class Consolidator:
                 if (
                     time.time() - self.last_run >= config.CONSOLIDATE_INTERVAL_S
                     and self.room_idle()
-                    and (self.db.memory_count_since(self.last_run) or self.db.messages_since(self.last_run, 1))
+                    and (self.db.memory_count_since(self.last_run) or self.db.messages_since(self.last_run, 1)
+                         or self.db.note_count_since(self.last_run))
                 ):
                     await self.run("idle")
             except Exception:
@@ -339,13 +394,14 @@ class Consolidator:
             await self.agent.emit("consolidation", f"memory review skipped: none of {config.MEMORY_MODELS} is in Ollama")
             return {"status": "no model"}
         t0 = time.time()
-        stats = {"model": model, "trigger": trigger, "added": 0, "merged_facts": 0, "rewritten": 0, "archived": 0,
-                 "topics": 0, "merged_topics": 0, "links": 0, "profiles": 0, "changes": []}
+        stats = {"model": model, "trigger": trigger, "added": 0, "from_notes": 0, "merged_facts": 0, "rewritten": 0,
+                 "archived": 0, "topics": 0, "merged_topics": 0, "links": 0, "profiles": 0, "changes": []}
         backup = self._backup()
         log.info("memory review started (%s, %s), backup %s", model, trigger, backup)
         await self.agent.emit("consolidation", f"memory review started ({model})", {"backup": backup})
 
         await self._catch_up(model, stats)
+        await self._promote_notes(model, stats)
         await self._organize(model, stats)
         await self._finish(stats, t0, None)
         return stats
@@ -355,8 +411,8 @@ class Consolidator:
         self.db.set_setting("consolidated_at", str(self.last_run))
         removed = self.db.delete_empty_topics()
         parts = [
-            f"{stats['added']} new facts", f"{stats['merged_facts']} merged", f"{stats['rewritten']} rewritten",
-            f"{stats['archived']} archived",
+            f"{stats['added']} new facts", f"{stats['from_notes']} from camera notes", f"{stats['merged_facts']} merged",
+            f"{stats['rewritten']} rewritten", f"{stats['archived']} archived",
             f"{stats['topics']} topics", f"{stats['links']} topic links", f"{stats['profiles']} profiles",
         ]
         if stats["merged_topics"]:
@@ -482,6 +538,70 @@ class Consolidator:
             self.db.set_setting("consolidated_messages_until", str(chunk_ts))
         if messages_tail_ts:
             self.db.set_setting("consolidated_messages_until", str(messages_tail_ts))
+
+    def _note_groups(self, notes: list[dict]) -> list[list[dict]]:
+        """Each group: a note and the later notes sharing most of its content words (overlap coefficient). Only
+        groups seen on separate occasions (NOTE_MIN_SPAN_S apart) count. Not transitive: chains through shared
+        room words ("window", "chair") would join unrelated notes."""
+        words = {n["id"]: content_words(n["text"]) for n in notes}
+        taken: set[int] = set()
+        groups = []
+        for seed in notes:
+            if seed["id"] in taken:
+                continue
+            a = words[seed["id"]]
+            group = [seed] + [
+                n for n in notes if n["ts"] > seed["ts"] and n["id"] not in taken
+                and len(a & words[n["id"]]) / (min(len(a), len(words[n["id"]])) or 1) >= NOTE_GROUP_SIMILARITY
+            ]
+            if group[-1]["ts"] - seed["ts"] >= NOTE_MIN_SPAN_S:
+                groups.append(group)
+                taken |= {n["id"] for n in group}
+        return groups
+
+    async def _promote_notes(self, model: str, stats: dict) -> None:
+        """Short-term camera notes become facts only when similar notes come back on separate occasions (code
+        finds those groups, the model judges them); notes nobody confirmed expire."""
+        now = time.time()
+        groups = self._note_groups(self.db.notes(since=now - NOTES_KEEP_S))[:8]
+        if groups:
+            people = self._people()
+            known = self.db.active_memories()
+
+            def shown(g: list[dict]) -> list[dict]:  # the first, the last and a few in between
+                return g if len(g) <= 6 else [g[0], *g[1:-1][:: max(1, (len(g) - 2) // 4)][:4], g[-1]]
+
+            result = await self._ask(model, NOTES_PROMPT.format(
+                groups="\n".join(
+                    f"Group {k}:\n" + "\n".join(
+                        f"  {datetime.fromtimestamp(n['ts']).strftime('%a %H:%M')}: {n['text']}" for n in shown(g))
+                    for k, g in enumerate(groups, 1)),
+                people=", ".join(p["name"] for p in people.values()) or "nobody yet",
+                known="\n".join(f"- [{m['person'] or 'household'}] {m['text']}" for m in known) or "nothing yet",
+            ), NOTES_SCHEMA, 1500)
+            for item in result.get("groups", []):
+                k, verdict = item.get("a_group"), item.get("d_verdict")
+                if not isinstance(k, int) or not 1 <= k <= len(groups):
+                    continue
+                g, fact = groups[k - 1], str(item.get("e_fact", "")).strip()
+                log.info("camera notes group %d: %s (remembered: %s) -> %s %s", k, item.get("b_shared"),
+                         item.get("c_remembered"), verdict, fact)
+                if verdict == "already_remembered":
+                    self.db.keep_notes([n["id"] for n in g])
+                if verdict != "lasting" or not fits(fact, max(len(n["text"]) for n in g)):
+                    continue
+                self.db.keep_notes([n["id"] for n in g])
+                if any(word_similarity(fact, m["text"]) >= DUPLICATE_SIMILARITY for m in known):
+                    continue
+                pid = self._person_for(people, str(item.get("f_about", "")), fact, None)
+                if self.db.add_memory(fact, pid):
+                    known.append({"person": None, "text": fact})
+                    stats["from_notes"] += 1
+                    stats["changes"].append({"added": fact, "from_notes": [n["text"] for n in g],
+                                             "about": next((p["name"] for p in people.values() if p["id"] == pid),
+                                                           "household")})
+        if expired := self.db.expire_notes(now - NOTES_KEEP_S):
+            log.info("forgot %d unconfirmed camera notes", expired)
 
     @staticmethod
     def _format_message(m: dict) -> str:  # noqa: C901
