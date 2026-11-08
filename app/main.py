@@ -165,9 +165,10 @@ async def memory() -> dict:
 
 
 @app.post("/api/consolidate")
-async def consolidate() -> dict:
-    """Run the memory review now (takes a while; returns its summary)."""
-    return await consolidator.run("manual")
+async def consolidate(background: bool = False) -> dict:
+    """Run the memory review now (takes a while; returns its summary). background=true runs it like the idle job,
+    which pauses as soon as someone is around."""
+    return await consolidator.run("background" if background else "manual")
 
 
 @app.post("/api/transcribe")

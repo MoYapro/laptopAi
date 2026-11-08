@@ -9,7 +9,8 @@ Runs when the room has been quiet for a while (or on demand via POST /api/consol
      sort facts into topics (merging duplicate topics), write person profiles, link related topics
 Every change is reversible: edited/removed facts are archived (memories.archived_ts / replaced_by), not deleted.
 The memory model runs outside the conversation lock: Ollama serves it next to the chat model
-(on the laptop on CPU via MEMORY_NUM_GPU=0), and the job stops between steps when someone shows up.
+(on the laptop on CPU via MEMORY_NUM_GPU=0). A background run gives way as soon as someone shows up (the running
+model call is cancelled) and continues in the next quiet period; a manual run (POST /api/consolidate) doesn't.
 """
 
 import asyncio
@@ -268,10 +269,15 @@ main interests, projects, preferences, and the people and animals in their life.
 current profile. Not their looks or clothes, nothing they are doing right now. Return JSON: profile."""
 
 
+class Paused(Exception):
+    """Someone became active during a background run; it continues in the next quiet period."""
+
+
 class Consolidator:
     def __init__(self, agent: "Agent"):
         self.agent, self.db, self.llm = agent, agent.db, agent.llm
         self.running = False
+        self.interruptible = False  # background runs give way to people; manual runs don't
         self.last_run = float(self.db.get_setting("consolidated_at", "0"))
 
     # ---------------------------------------------------------------- triggers
@@ -282,6 +288,15 @@ class Consolidator:
         last_msg = self.db.last_message_ts() or 0
         last_seen = max((p["last_seen"] or 0 for p in self.db.people()), default=0)
         return time.time() - max(last_msg, last_seen) >= config.CONSOLIDATE_IDLE_S
+
+    def someone_active(self) -> bool:
+        """Someone in view, a reply being made, or a message just now."""
+        last_msg = self.db.last_message_ts() or 0
+        return bool(self.agent.user_busy or self.agent.presence.present() or time.time() - last_msg < 120)
+
+    def _check_active(self) -> None:
+        if self.interruptible and self.someone_active():
+            raise Paused()
 
     async def loop(self) -> None:
         while True:
@@ -302,8 +317,14 @@ class Consolidator:
         if self.running:
             return {"status": "already running"}
         self.running = True
+        self.interruptible = trigger != "manual"
         try:
             return await self._run(trigger)
+        except Paused:
+            log.info("memory review paused: someone is around")
+            await self.agent.emit("consolidation", "memory review paused: someone is around (it continues in the "
+                                  "next quiet period; what was done so far is kept)")
+            return {"status": "paused"}
         except Exception as e:
             log.exception("memory review failed")
             await self.agent.emit("consolidation", f"memory review failed: {e} (changes so far are reversible; "
@@ -325,9 +346,6 @@ class Consolidator:
         await self.agent.emit("consolidation", f"memory review started ({model})", {"backup": backup})
 
         await self._catch_up(model, stats)
-        if trigger != "manual" and not self.room_idle():
-            await self._finish(stats, t0, "paused after catch-up: someone is around")
-            return stats
         await self._organize(model, stats)
         await self._finish(stats, t0, None)
         return stats
@@ -360,6 +378,11 @@ class Consolidator:
     def _backup(self) -> str:
         folder = config.DATA_DIR / "backups"
         folder.mkdir(exist_ok=True)
+        # A run paused and resumed (maybe several times) keeps the backup from its first start.
+        since = max(float(self.db.get_setting("consolidated_at", "0")), time.time() - 6 * 3600)
+        unfinished = [b for b in folder.glob("laptopai-2*.db") if b.stat().st_mtime > since]
+        if unfinished:
+            return f"backups/{min(unfinished, key=lambda b: b.stat().st_mtime).name}"
         path = folder / f"laptopai-{datetime.now():%Y%m%d-%H%M%S}.db"
         self.db.backup(path)
         for old in sorted(folder.glob("laptopai-*.db"))[: -config.BACKUPS_KEEP]:
@@ -371,17 +394,37 @@ class Consolidator:
         if config.MEMORY_NUM_GPU >= 0:
             options["num_gpu"] = config.MEMORY_NUM_GPU
         for attempt in (1, 2):
-            raw = await self.llm.complete(
+            raw = await self._interruptible(self.llm.complete(
                 [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
                 schema=schema, max_tokens=max_tokens, temperature=0.1 if attempt == 1 else 0.3, model=model,
                 think=config.MEMORY_THINK if think is None else think, options=options, keep_alive="5m",
-            )
+            ))
             try:
                 return json.loads(raw)
             except json.JSONDecodeError as e:
                 if attempt == 2:
                     raise
                 log.warning("invalid JSON from %s (%d chars, %s), retrying", model, len(raw), e)
+
+    async def _interruptible(self, call):
+        """Run a model call, but cancel it as soon as someone becomes active (a background run can take half an
+        hour on CPU). Cancelling closes the HTTP request, which makes Ollama stop generating."""
+        try:
+            self._check_active()
+        except Paused:
+            call.close()  # never started
+            raise
+        task = asyncio.ensure_future(call)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=5)
+                if done:
+                    return task.result()
+                self._check_active()
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     # ------------------------------------------------- step 1: conversations
 
