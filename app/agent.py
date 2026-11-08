@@ -117,6 +117,85 @@ def answer_supported(answer: str, question: str, user_text: str) -> bool:
     return bool(novel & words(user_text))
 
 
+def _stem(w: str) -> str:
+    for suffix in ("ing", "ed", "es", "s"):
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            return w[: -len(suffix)]
+    return w
+
+
+FILLER = set("""like likes liked remember know knew think want wants about just really yes yeah okay good well also
+can could would will should have has had there here now then from into than more very much some any all one get got
+make see seen look say said tell told thing things something over under while still currently right today again maybe""".split())
+
+
+def keywords(text: str) -> set[str]:
+    return {
+        _stem(w) for w in re.findall(r"[a-zäöüß0-9]+", text.lower())
+        if len(w) > 2 and w not in STOPWORDS and w not in FILLER
+    }
+
+
+def _covered(new: set[str], old: set[str]) -> bool:
+    """new adds (almost) nothing to old: most of its words are already there."""
+    return len(new) >= 2 and len(new & old) / len(new) >= 0.75
+
+
+def _similar(a: set[str], b: set[str]) -> bool:
+    return _covered(a, b) or _covered(b, a)
+
+
+def fact_text(text: str) -> str:
+    return text.strip().rstrip(".")
+
+
+def select_facts(facts: list[dict], query: set[str], limit: int, newest: int, shown: list[set[str]]) -> list[dict]:
+    """facts oldest first. Drops near-duplicates (keeping the newer one), always keeps the `newest` latest,
+    fills up with facts sharing words with the query, then with the next newest. Returns oldest first.
+    shown: keyword sets of facts already in the prompt; the chosen ones are added to it."""
+    unique: list[tuple[dict, set[str]]] = []
+    for f in reversed(facts):
+        kw = keywords(f["text"])
+        if not any(_covered(kw, k) for k in shown) and not any(_similar(kw, k) for _, k in unique):
+            unique.append((f, kw))
+    chosen = [f for f, _ in unique[:newest]]
+    rest = unique[newest:]
+    scored = sorted(((len(kw & query), i) for i, (_, kw) in enumerate(rest)), key=lambda s: (-s[0], s[1]))
+    chosen += [rest[i][0] for score, i in scored if score][: limit - len(chosen)]
+    chosen += [f for f, _ in rest if f not in chosen][: limit - len(chosen)]
+    shown += [kw for f, kw in unique if f in chosen]
+    return sorted(chosen, key=lambda f: f["ts"])
+
+
+def compact_timeline(events: list[dict]) -> list[str]:
+    """Collapse stop/start pairs into "restarted" (consecutive restarts into one line) and drop
+    re-arrivals right after a restart or a short absence."""
+    out: list[tuple[float, str, str]] = []  # (ts, kind, text)
+    last_start = 0.0
+    for i, e in enumerate(events):
+        kind, ts = e["kind"], e["ts"]
+        nxt = events[i + 1] if i + 1 < len(events) else None
+        if kind == "system_stop" and nxt and nxt["kind"] == "system_start":
+            continue
+        if kind == "system_start":
+            last_start = ts
+            prev = events[i - 1] if i else None
+            if prev and prev["kind"] == "system_stop":
+                off = fmt_dur(ts - prev["ts"])
+                if out and out[-1][1] == "restart":
+                    n = int(re.search(r"(\d+) times", out[-1][2]).group(1)) + 1 if "times" in out[-1][2] else 2
+                    out[-1] = (ts, "restart", f"system restarted {n} times (last at {hhmm(ts)}, off for {off})")
+                else:
+                    out.append((ts, "restart", f"system restarted (off for {off})"))
+                continue
+        if kind == "person_arrived":
+            away = (e.get("data") or {}).get("away_s")
+            if ts - last_start < 90 or (away is not None and away < 120):
+                continue
+        out.append((ts, kind, e["text"]))
+    return [f"- {hhmm(ts)} {text}" for ts, _, text in out]
+
+
 class Agent:
     def __init__(self, db: DB, llm: Ollama, tts: TTS, presence: Presence, hub: Hub, base_prompt):
         self.db, self.llm, self.tts, self.presence, self.hub = db, llm, tts, presence, hub
@@ -163,12 +242,13 @@ class Agent:
 
     # -------------------------------------------------------------- context
 
-    def system_prompt(self, answering: str | None = None) -> str:
-        """answering: where the message being answered came from; restated last, where small models attend most."""
+    def system_prompt(self, answering: str | None = None, query: str = "") -> str:
+        """answering: where the message being answered came from; restated last, where small models attend most.
+        query: the message being answered; memories related to it (and to the recent chat) are preferred."""
         prompt = (
             self.base_prompt().strip()
             + "\n\n# Current situation\n"
-            + self.context()
+            + self.context(query)
             + "\n\nReminder: the facts above and this conversation are everything you know. "
             "Do not invent past meetings, dates, or things you supposedly saw or did. Reply in plain spoken words."
         )
@@ -176,26 +256,54 @@ class Agent:
             prompt += f"\nThe message you are answering now: {answering}."
         return prompt
 
-    def person_knowledge(self, pid: int, name: str) -> list[str]:
-        """Profile, recent facts and the topics talked about with this person (from the consolidated memory)."""
+    def person_knowledge(self, pid: int, name: str, query: set[str], shown: list[set[str]]) -> list[str]:
+        """Profile, the facts most worth showing now and the topics talked about with this person."""
         lines = []
         person = self.db.person(pid) or {}
         if person.get("profile"):
             lines.append(f"  Who {name} is to you: {person['profile']}")
-        facts = self.db.memories(pid, 8)
-        lines.append(f"  What you remember about {name}: " + ("; ".join(f["text"] for f in facts) or "nothing yet"))
-        topics = self.db.topics_for_person(pid, 6)
+            shown.append(keywords(person["profile"]))
+        facts = select_facts(self.db.memories(pid, 500), query, limit=8, newest=3, shown=shown)
+        lines.append(f"  What you remember about {name}: " + ("; ".join(fact_text(f["text"]) for f in facts) or "nothing yet"))
+        topics = self.db.topics_for_person(pid, 5)
         if topics:
-            parts = []
-            for t in topics:
-                when = f"talked about {ago(t['last_ts'])}" if t["count"] else "connected to them"
-                related = self.db.related_topic_names(t["id"])
-                parts.append(f"{t['name']} ({when}" + (f"; related: {', '.join(related)}" if related else "") + ")")
+            parts = [f"{t['name']} ({'talked about ' + ago(t['last_ts']) if t['count'] else 'connected to them'})" for t in topics]
             lines.append(f"  Topics with {name}: " + "; ".join(parts))
         return lines
 
-    def context(self) -> str:
+    def query_words(self, query: str) -> set[str]:
+        """What the conversation is about: the message being answered, else the last few user messages."""
+        if words := keywords(query):
+            return words
+        recent = self.db.recent_messages(6, since=time.time() - 1800)
+        return keywords(" ".join(m["content"] for m in recent if m["role"] == "user"))
+
+    def related_memory(self, query: set[str], shown: list[set[str]]) -> list[str]:
+        """Facts of the (at most two) topics that best match the conversation, not already shown elsewhere."""
+        if not query:
+            return []
+        scored = []
+        for t in self.db.topics():
+            score = 2 * len(keywords(t["name"]) & query) + len(keywords(t["summary"]) & query) + max(
+                (len(keywords(f["text"]) & query) for f in t["facts"]), default=0)
+            if score:
+                scored.append((score, t))
+        lines = []
+        for _, t in sorted(scored, key=lambda s: -s[0])[:2]:
+            items = []
+            for text in [t["summary"], *(f["text"] for f in reversed(t["facts"]))]:
+                kw = keywords(text)
+                if kw and not any(_covered(kw, k) for k in shown) and len(items) < 4:
+                    items.append(fact_text(text))
+                    shown.append(kw)
+            if items:
+                lines.append(f"- {t['name']}: " + "; ".join(items))
+        return ["Memories related to the conversation:", *lines] if lines else []
+
+    def context(self, query: str = "") -> str:
         now = time.time()
+        qwords = self.query_words(query)
+        shown: list[set[str]] = []
         lines = [f"Current time: {fmt_ts(now)}."]
 
         present = self.presence.present()
@@ -218,7 +326,7 @@ class Agent:
                 else:
                     visit += ", first time you see them"
                 lines.append(f"- {t.name} ({visit}).")
-                lines += self.person_knowledge(t.person_id, t.name)
+                lines += self.person_knowledge(t.person_id, t.name, qwords, shown)
         else:
             lines.append("You don't recognize any face right now (the room may be empty, or faces are turned away).")
 
@@ -228,14 +336,13 @@ class Agent:
             if pid not in {t.person_id for t in present}:
                 person = self.db.person(pid)
                 lines.append(f"The person you are talking to said they are {person['name']} (face not recognized).")
-                lines += self.person_knowledge(pid, person["name"])
+                lines += self.person_knowledge(pid, person["name"], qwords, shown)
 
-        if household := self.db.memories(None, 10):
-            lines.append("What you know about this place: " + "; ".join(f["text"] for f in household))
+        if household := select_facts(self.db.memories(None, 500), qwords, limit=8, newest=3, shown=shown):
+            lines.append("What you know about this place: " + "; ".join(fact_text(f["text"]) for f in household))
+        lines += self.related_memory(qwords, shown)
         if topics := self.db.topics()[:6]:
-            lines.append("Topics in your memory (most recent first): " + "; ".join(
-                f"{t['name']}" + (f" ({t['summary']})" if t["summary"] else "") for t in topics
-            ))
+            lines.append("Topics in your memory (most recent first): " + ", ".join(t["name"] for t in topics) + ".")
         lines += self.curiosity.context_lines()
         lines.append(
             "Internet lookups: available (look_up tool)." if self.internet
@@ -245,10 +352,12 @@ class Agent:
         if self.latest_scene:
             lines.append(f"Latest camera description ({ago(self.latest_scene['ts'])}): {self.latest_scene['text']}")
 
-        timeline = self.db.recent_events(15, exclude=["decision", "memory", "setting", "initiative_quiet"])
-        if timeline:
+        events = self.db.recent_events(60, exclude=["decision", "memory", "setting", "initiative_quiet"])
+        if self.latest_scene:  # shown above already
+            events = [e for e in events if e["id"] != self.latest_scene.get("id")]
+        if timeline := compact_timeline(events)[-15:]:
             lines.append("Recent timeline (oldest first):")
-            lines += [f"- {hhmm(e['ts'])} {e['text']}" for e in timeline]
+            lines += timeline
 
         last_msg = self.db.last_message_ts()
         if last_msg and now - last_msg > 1800:
@@ -279,7 +388,7 @@ class Agent:
             async with self.lock:
                 timings["queue_ms"] = ms()
                 answering = tag_message("", source, sender).rstrip(":\n")
-                messages = [{"role": "system", "content": self.system_prompt(answering)}, *self.history(), user_msg]
+                messages = [{"role": "system", "content": self.system_prompt(answering, text)}, *self.history(), user_msg]
                 self.db.add_message("user", text, source, names, sender=sender)
 
                 speech_queue: asyncio.Queue = asyncio.Queue()
@@ -605,7 +714,10 @@ Return JSON:
         else:
             who = track.name or "the unknown person"
             text = f"{who} left (was here for {fmt_dur(track.last_seen - track.first_seen)})"
-        await self.emit(f"person_{kind}", text, {"key": track.key, "person_id": track.person_id})
+        data = {"key": track.key, "person_id": track.person_id}
+        if kind == "arrived" and track.prev_seen:
+            data["away_s"] = round(track.first_seen - track.prev_seen)
+        await self.emit(f"person_{kind}", text, data)
         await self.broadcast_presence()
 
     # ----------------------------------------------------------- lifecycle

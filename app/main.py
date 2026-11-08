@@ -12,7 +12,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import config
@@ -130,6 +130,12 @@ async def status() -> dict:
         "internet": agent.internet,
         "present": [t.public() for t in presence.present()],
     }
+
+
+@app.get("/api/prompt")
+async def prompt(q: str = "") -> PlainTextResponse:
+    """The conversation system prompt as it would be sent now; q: a message to answer (steers memory selection)."""
+    return PlainTextResponse(agent.system_prompt(query=q))
 
 
 @app.get("/memory")
