@@ -48,9 +48,11 @@ class STT:
 
 
 class TTS:
-    def __init__(self, voice: str, voice_dir: Path):
+    def __init__(self, voice: str, voice_dir: Path, speed: float = 1.0, variation: float = 1.0):
         self.voice_name, self.voice_dir = voice, voice_dir
+        self.speed, self.variation = speed, variation
         self._voice = None
+        self._config = None
         self._lock = threading.Lock()
 
     def _get(self):
@@ -65,14 +67,26 @@ class TTS:
                     self.voice_dir.mkdir(parents=True, exist_ok=True)
                     download_voice(self.voice_name, self.voice_dir)
                 self._voice = PiperVoice.load(model)
+                self._config = self._synthesis_config(self._voice)
             return self._voice
+
+    def _synthesis_config(self, voice):
+        """Speed and variation relative to the voice's own defaults (they differ per voice)."""
+        from piper import SynthesisConfig
+
+        c = voice.config
+        return SynthesisConfig(
+            length_scale=c.length_scale / self.speed,
+            noise_scale=c.noise_scale * self.variation,
+            noise_w_scale=c.noise_w_scale * self.variation,
+        )
 
     def load(self) -> None:
         self._get()
 
     def synthesize_wav(self, text: str) -> bytes:
         voice = self._get()
-        chunks = list(voice.synthesize(text))
+        chunks = list(voice.synthesize(text, syn_config=self._config))
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wav:
             wav.setnchannels(1)

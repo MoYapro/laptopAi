@@ -32,7 +32,9 @@ services:
       LOOKUP_CONTACT: ${LOOKUP_CONTACT:-}   # email or URL for Wikimedia's user-agent policy; enables the Wikipedia fallback
       WHISPER_MODEL: ${WHISPER_MODEL:-small}
       WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
-      PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
+      PIPER_VOICE: ${PIPER_VOICE:-en_US-amy-medium}
+      PIPER_SPEED: ${PIPER_SPEED:-1.1}           # Piper speed factor (1.1 ≈ 5% faster speech, 1.2 ≈ 10%)
+      PIPER_VARIATION: ${PIPER_VARIATION:-1.25}  # >1 = livelier intonation and timing
     stop_grace_period: 20s   # time to write the shutdown event
     volumes:
       - /etc/localtime:/etc/localtime:ro   # host time zone, so timestamps are local time

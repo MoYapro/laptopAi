@@ -28,7 +28,9 @@ LLM_MODEL = _str("LLM_MODEL", "qwen3.5:4b")
 LLM_THINK = _bool("LLM_THINK")
 WHISPER_MODEL = _str("WHISPER_MODEL", "small")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "").strip() or None
-PIPER_VOICE = _str("PIPER_VOICE", "en_US-lessac-medium")
+PIPER_VOICE = _str("PIPER_VOICE", "en_US-amy-medium")
+PIPER_SPEED = _float("PIPER_SPEED", 1.1)  # Piper speed factor (not 1:1: 1.1 is about 5% faster speech, 1.2 about 10%)
+PIPER_VARIATION = _float("PIPER_VARIATION", 1.25)  # >1 = livelier intonation and timing; much above 1.5 gets slurred
 CAMERA_DEVICE = _str("CAMERA_DEVICE", "/dev/video0")
 
 # --- conversation
