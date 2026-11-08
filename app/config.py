@@ -19,7 +19,7 @@ def _bool(name: str) -> bool | None:
 APP_DIR = Path(__file__).parent
 DATA_DIR = Path(_str("DATA_DIR", "/data"))
 MODELS_DIR = Path(_str("MODELS_DIR", "/models"))
-FACE_MODELS_DIR = Path(_str("FACE_MODELS_DIR", "/opt/face-models"))
+FACE_MODELS_DIR = Path(_str("FACE_MODELS_DIR", "/models/face"))  # downloaded on first start (faces.ensure_face_models)
 SNAPSHOT_DIR = DATA_DIR / "snapshots"
 
 # --- models
@@ -55,6 +55,23 @@ FACE_RECOGNITION_THREADS = int(_float("FACE_RECOGNITION_THREADS", 2))
 PERSON_LEFT_AFTER_S = _float("PERSON_LEFT_AFTER_S", 30)
 
 REPLY_TEMPERATURE = _float("REPLY_TEMPERATURE", 0.6)
+# Ollama's default context is only 4096 tokens and it silently drops the start of longer prompts
+# (that is where the instructions are). Situation + timeline + history + image need more.
+CHAT_NUM_CTX = int(_float("CHAT_NUM_CTX", 8192))
+
+# --- memory consolidation (background job with a bigger model, see consolidation.py)
+# Preference list: the first model available in Ollama is used (the uncensored 9B is a local LM Studio
+# import that only exists on the desktop; the laptop falls back to the registry model).
+MEMORY_MODELS = [m.strip() for m in _str("MEMORY_MODEL", "qwen3.5-9b-uncensored,qwen3.5:9b").split(",") if m.strip()]
+MEMORY_THINK = _bool("MEMORY_THINK") or False
+MEMORY_NUM_CTX = int(_float("MEMORY_NUM_CTX", 16384))
+# GPU layers for the memory model: unset = let Ollama decide; 0 = CPU/RAM only (use on the 4 GB laptop,
+# so the conversation model keeps the GPU).
+MEMORY_NUM_GPU = int(_str("MEMORY_NUM_GPU", "-1"))
+CONSOLIDATE_IDLE_S = _float("CONSOLIDATE_IDLE_S", 1800)  # nobody in view and no chat for this long
+CONSOLIDATE_INTERVAL_S = _float("CONSOLIDATE_INTERVAL_S", 4 * 3600)
+CONSOLIDATE_MAX_ARCHIVE_FRACTION = _float("CONSOLIDATE_MAX_ARCHIVE_FRACTION", 0.3)
+BACKUPS_KEEP = int(_float("BACKUPS_KEEP", 10))
 
 # --- initiative
 INITIATIVE_REQUIRES_FACE = _bool("INITIATIVE_REQUIRES_FACE") is not False  # never talk to an empty room

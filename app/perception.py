@@ -29,7 +29,7 @@ CAPTION_DUPLICATE_SIMILARITY = 0.75
 
 
 class Perception:
-    def __init__(self, camera: Camera, engine: FaceEngine, presence: Presence, agent: Agent):
+    def __init__(self, camera: Camera, engine: FaceEngine | None, presence: Presence, agent: Agent):
         self.camera, self.engine, self.presence, self.agent = camera, engine, presence, agent
         self.reference: np.ndarray | None = None  # downscaled gray keyframe for change detection
         self.last_describe = 0.0
@@ -67,7 +67,7 @@ class Perception:
             return
         now = time.time()
 
-        detections = await asyncio.to_thread(self.engine.analyze, frame)
+        detections = await asyncio.to_thread(self.engine.analyze, frame) if self.engine else []
         for kind, track in self.presence.update(detections, now):
             await self.agent.on_presence(kind, track)
             if kind == "arrived":

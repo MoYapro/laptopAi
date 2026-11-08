@@ -95,6 +95,9 @@ CAMERA_DEVICE=$camera
 # --- models (keep the LLM under ~3 GB so it fits the laptop's 4 GB VRAM)
 LLM_MODEL=${LLM_MODEL:-qwen3.5:4b}
 LLM_THINK=${LLM_THINK:-false}
+# background memory review: first available model is used; 0 GPU layers keeps it on CPU/RAM
+MEMORY_MODEL=${MEMORY_MODEL:-qwen3.5-9b-uncensored,qwen3.5:9b}
+MEMORY_NUM_GPU=${MEMORY_NUM_GPU:-$([[ $gpu == nvidia ]] && echo 0 || echo -1)}
 WHISPER_MODEL=${WHISPER_MODEL:-small}
 WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-}
 PIPER_VOICE=${PIPER_VOICE:-en_US-lessac-medium}
@@ -145,6 +148,18 @@ if $run_llm; then
   if ! docker compose exec -T llm ollama show "$model" >/dev/null 2>&1; then
     info "pulling $model (first run only)"
     docker compose exec -T llm ollama pull "$model"
+  fi
+
+  # Memory model: a preference list; if none of them is available, pull the last (a registry model).
+  memory_models=$(docker compose config | awk '$1 == "MEMORY_MODEL:" { gsub(/"/, "", $2); print $2; exit }')
+  have_memory_model=false
+  IFS=',' read -ra candidates <<<"$memory_models"
+  for m in "${candidates[@]}"; do
+    docker compose exec -T llm ollama show "$m" >/dev/null 2>&1 && { have_memory_model=true; break; }
+  done
+  if ! $have_memory_model && [[ ${#candidates[@]} -gt 0 ]]; then
+    info "pulling memory model ${candidates[-1]} (first run only)"
+    docker compose exec -T llm ollama pull "${candidates[-1]}"
   fi
 else
   info "no llm service enabled; using external Ollama (OLLAMA_URL in .env)"

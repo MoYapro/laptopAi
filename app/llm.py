@@ -1,4 +1,4 @@
-"""Streaming chat client for Ollama."""
+"""Ollama client: streaming chat for conversation, non-streaming (optionally JSON-constrained) calls."""
 
 import json
 from collections.abc import AsyncIterator
@@ -7,17 +7,26 @@ import httpx
 
 
 class Ollama:
-    def __init__(self, url: str, model: str, think: bool | None):
-        self.url, self.model, self.think = url.rstrip("/"), model, think
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=300))
+    def __init__(self, url: str, model: str, think: bool | None, num_ctx: int | None = None):
+        self.url, self.model, self.think, self.num_ctx = url.rstrip("/"), model, think, num_ctx
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10, read=900))
+
+    def _body(self, messages, model, think, stream, options, keep_alive) -> dict:
+        body: dict = {"model": model or self.model, "messages": messages, "stream": stream}
+        think = self.think if think is None else think
+        if think is not None:
+            body["think"] = think
+        opts = {"num_ctx": self.num_ctx} if self.num_ctx else {}
+        opts.update({k: v for k, v in (options or {}).items() if v is not None})
+        if opts:
+            body["options"] = opts
+        if keep_alive is not None:
+            body["keep_alive"] = keep_alive
+        return body
 
     async def chat(self, messages: list[dict], temperature: float | None = None) -> AsyncIterator[dict]:
         """Yields Ollama's NDJSON chunks; the last one has done=True and timing stats."""
-        body: dict = {"model": self.model, "messages": messages, "stream": True}
-        if self.think is not None:
-            body["think"] = self.think
-        if temperature is not None:
-            body["options"] = {"temperature": temperature}
+        body = self._body(messages, None, None, True, {"temperature": temperature}, None)
         async with self._client.stream("POST", f"{self.url}/api/chat", json=body) as resp:
             if resp.status_code != 200:
                 detail = (await resp.aread()).decode(errors="replace")
@@ -32,20 +41,14 @@ class Ollama:
     async def complete(
         self, messages: list[dict], schema: dict | None = None,
         max_tokens: int | None = None, temperature: float | None = None,
+        model: str | None = None, think: bool | None = None,
+        options: dict | None = None, keep_alive: str | None = None,
     ) -> str:
         """Non-streaming chat call; with a JSON schema, Ollama constrains the output to it."""
-        body: dict = {"model": self.model, "messages": messages, "stream": False}
-        if self.think is not None:
-            body["think"] = self.think
+        opts = {"num_predict": max_tokens, "temperature": temperature, **(options or {})}
+        body = self._body(messages, model, think, False, opts, keep_alive)
         if schema:
             body["format"] = schema
-        options = {}
-        if max_tokens:
-            options["num_predict"] = max_tokens
-        if temperature is not None:
-            options["temperature"] = temperature
-        if options:
-            body["options"] = options
         resp = await self._client.post(f"{self.url}/api/chat", json=body)
         if resp.status_code != 200:
             raise RuntimeError(f"Ollama {resp.status_code}: {resp.text}")
@@ -53,8 +56,15 @@ class Ollama:
 
     async def load(self) -> None:
         """Ask Ollama to load the model into memory (a generate call without a prompt)."""
-        resp = await self._client.post(f"{self.url}/api/generate", json={"model": self.model})
+        body = {"model": self.model}
+        if self.num_ctx:
+            body["options"] = {"num_ctx": self.num_ctx}
+        resp = await self._client.post(f"{self.url}/api/generate", json=body)
         resp.raise_for_status()
+
+    async def has_model(self, model: str) -> bool:
+        resp = await self._client.post(f"{self.url}/api/show", json={"model": model})
+        return resp.status_code == 200
 
     async def ping(self) -> bool:
         try:

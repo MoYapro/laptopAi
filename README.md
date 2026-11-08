@@ -102,6 +102,24 @@ insisting on something false, delete those rows from the `messages` table in `da
 | `CURIOSITY_IDLE_S` | 300 | quiet this long with someone in view → it may ask one of its questions |
 | `QUESTION_REASK_S` / `QUESTION_MAX_ASKS` | 21600 / 2 | don't re-ask a question sooner / more often than this |
 
+## Memory review (consolidation)
+
+A background job with a bigger model organizes what Housemate knows (`app/consolidation.py`):
+
+- **When:** nobody in view and no chat for 30 min, at most every 4 h, only if something new happened. Or now:
+  `project-scripts/consolidate.sh`, or **Review now** on the memory page (`/memory`).
+- **Model:** the first available of `MEMORY_MODEL` (default `qwen3.5-9b-uncensored,qwen3.5:9b`). On the laptop
+  `start.sh` sets `MEMORY_NUM_GPU=0`, so it runs on CPU/RAM and the conversation model keeps the 4 GB GPU.
+- **Steps:** backup to `data/backups/` → catch up on conversations (facts missed after replies, which topics were
+  discussed with whom; developer-tool exchanges are skipped) → fix facts (merge duplicates, attach to the right
+  person, archive trivial/outdated) → sort facts into topics, merge duplicate topics, write profiles → link related topics.
+- **Guards in code** (the 9B model doesn't follow these reliably on its own): facts about a moment are skipped, a
+  fact starting with a known name belongs to that person, person facts never move to "household", only
+  near-identical facts are merged, rewrites can't grow into multi-fact sentences, at most 30% archived per run.
+- **Reversible:** nothing is deleted; changed facts are archived with a reason and a pointer to their replacement.
+- **Used by the conversation:** for each person in view, their profile, recent facts and the topics talked about with
+  them (and related topics) are in the context.
+
 ## Face recognition
 
 Works like a face-login enrollment, without liveness detection (that needs an IR/3D camera; a photo of someone
@@ -116,6 +134,9 @@ would be recognized as them, which is fine for a home assistant but not for secu
   10/10 other views of the same person were recognized.
 - Embeddings are tagged with their model; switching models means re-enrolling (name the person once on the page).
 - InsightFace's pretrained models are licensed for non-commercial use only.
+- The face model files are downloaded on first start into the `models` volume (`/models/face`), checksum-verified,
+  with GitHub and Hugging Face as alternative sources. Builds need no model downloads, and a missing model only
+  disables face recognition, it doesn't stop the app.
 
 ## Privacy
 

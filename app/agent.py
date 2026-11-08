@@ -78,8 +78,9 @@ MEMORY_SCHEMA = {
                 "required": ["id", "answer"],
             },
         },
+        "topics": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["introduced_name", "facts", "answered"],
+    "required": ["introduced_name", "facts", "answered", "topics"],
 }
 
 
@@ -172,6 +173,24 @@ class Agent:
             prompt += f"\nThe message you are answering now: {answering}."
         return prompt
 
+    def person_knowledge(self, pid: int, name: str) -> list[str]:
+        """Profile, recent facts and the topics talked about with this person (from the consolidated memory)."""
+        lines = []
+        person = self.db.person(pid) or {}
+        if person.get("profile"):
+            lines.append(f"  Who {name} is to you: {person['profile']}")
+        facts = self.db.memories(pid, 8)
+        lines.append(f"  What you remember about {name}: " + ("; ".join(f["text"] for f in facts) or "nothing yet"))
+        topics = self.db.topics_for_person(pid, 6)
+        if topics:
+            parts = []
+            for t in topics:
+                when = f"talked about {ago(t['last_ts'])}" if t["count"] else "connected to them"
+                related = self.db.related_topic_names(t["id"])
+                parts.append(f"{t['name']} ({when}" + (f"; related: {', '.join(related)}" if related else "") + ")")
+            lines.append(f"  Topics with {name}: " + "; ".join(parts))
+        return lines
+
     def context(self) -> str:
         now = time.time()
         lines = [f"Current time: {fmt_ts(now)}."]
@@ -195,9 +214,8 @@ class Agent:
                     visit += f", before that last seen {ago(t.prev_seen)}"
                 else:
                     visit += ", first time you see them"
-                facts = self.db.memories(t.person_id, 8)
-                known = "; ".join(f["text"] for f in facts) or "nothing yet"
-                lines.append(f"- {t.name} ({visit}). What you remember about {t.name}: {known}")
+                lines.append(f"- {t.name} ({visit}).")
+                lines += self.person_knowledge(t.person_id, t.name)
         else:
             lines.append("You don't recognize any face right now (the room may be empty, or faces are turned away).")
 
@@ -206,15 +224,15 @@ class Agent:
             pid = self.claimed[0]
             if pid not in {t.person_id for t in present}:
                 person = self.db.person(pid)
-                facts = self.db.memories(pid, 8)
-                known = "; ".join(f["text"] for f in facts) or "nothing yet"
-                lines.append(
-                    f"The person you are talking to said they are {person['name']} "
-                    f"(face not recognized). What you remember about {person['name']}: {known}"
-                )
+                lines.append(f"The person you are talking to said they are {person['name']} (face not recognized).")
+                lines += self.person_knowledge(pid, person["name"])
 
         if household := self.db.memories(None, 10):
             lines.append("What you know about this place: " + "; ".join(f["text"] for f in household))
+        if topics := self.db.topics()[:6]:
+            lines.append("Topics in your memory (most recent first): " + "; ".join(
+                f"{t['name']}" + (f" ({t['summary']})" if t["summary"] else "") for t in topics
+            ))
         lines += self.curiosity.context_lines()
 
         if self.latest_scene:
@@ -433,6 +451,7 @@ class Agent:
             before = f"Before that, the AI said: {recent[0]['content']}\n"
 
         open_qs = self.db.open_questions(12)
+        topic_names = ", ".join(t["name"] for t in self.db.topics()[:30]) or "none yet"
         questions = "\n".join(f"#{q['id']} {q['text']}" for q in open_qs) or "none"
 
         prompt = f"""Conversation snippet:
@@ -443,10 +462,12 @@ AI: {reply}
 Already remembered: {"; ".join(known_facts) or "nothing"}
 Open questions the AI wants answered:
 {questions}
+Existing topics: {topic_names}
 
 Return JSON:
 - introduced_name: the name the user just said they are called ("I'm Anna", "my name is Anna"); otherwise "".
 - facts: new durable facts worth remembering for future conversations (interests, projects, plans, preferences, important events, relationships, things in the home). Each has "about" (the person's name, or "household" if it's about the place or unclear) and "fact" (one short sentence in third person, using names). Skip small talk, things only relevant right now, and anything already remembered. Usually this list is empty.
+- topics: the topics this exchange was about (0-2), as short general names. Reuse an existing topic name when it fits, e.g. "Sim racing", "Luna the cat", "Housemate project". Empty for small talk.
 - answered: only the open questions that the user's message actually answers, each with "id" (the #number) and "answer" (one short sentence stating the answer, e.g. "The cat is called Mila."). Leave out every question the message does not answer. Usually empty."""
         async with self.lock:
             raw = await self.llm.complete(
@@ -469,6 +490,17 @@ Return JSON:
                 pid = self.db.get_or_create_person(about)["id"]
             if self.db.add_memory(fact, pid):
                 await self.emit("memory", f"remembered{f' about {about}' if pid else ''}: {fact}")
+
+        # Topics talked about, linked to who was talking (known faces in view, or a name they just gave).
+        if not from_tool:
+            talkers = [t.person_id for t in known]
+            if not talkers and self.claimed and time.time() - self.claimed[1] < 1800:
+                talkers = [self.claimed[0]]
+            for name in [str(n).strip() for n in result.get("topics", [])][:2]:
+                if name:
+                    tid = self.db.upsert_topic(name)
+                    for pid in talkers:
+                        self.db.touch_topic_person(tid, pid)
 
         by_id = {q["id"]: q for q in open_qs}
         for item in result.get("answered", [])[:3]:

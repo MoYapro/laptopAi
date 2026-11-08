@@ -9,9 +9,14 @@ Recognition works like a face-login enrollment, minus liveness checks (which nee
 YuNet ships with OpenCV; ArcFace runs on onnxruntime. Both on CPU: ~10 ms + ~45 ms per face.
 """
 
+import hashlib
 import itertools
 import logging
+import os
+import shutil
 import time
+import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 
 import cv2
@@ -29,6 +34,72 @@ ARCFACE_TEMPLATE = np.array(
     [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
     dtype=np.float32,
 )
+
+
+# Face model files: downloaded on first start into the persistent models volume (not at build time, so a
+# GitHub outage can't break builds). Each has a pinned checksum and two independent sources.
+FACE_MODEL_FILES = {
+    "yunet.onnx": {
+        "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        "sources": [
+            ("https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx", None),
+            ("https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx", None),
+        ],
+    },
+    # ArcFace w600k_r50 from InsightFace's buffalo_l pack. InsightFace's pretrained models are non-commercial use only.
+    "w600k_r50.onnx": {
+        "sha256": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
+        "sources": [
+            ("https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/w600k_r50.onnx", None),
+            ("https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip", "w600k_r50.onnx"),
+        ],
+    },
+}
+
+
+def _sha256(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def ensure_face_models(folder) -> None:
+    """Make sure every face model file exists with the right checksum; download it otherwise."""
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, spec in FACE_MODEL_FILES.items():
+        target = folder / name
+        if target.exists() and _sha256(target) == spec["sha256"]:
+            continue
+        errors = []
+        for attempt in range(3):
+            for url, member in spec["sources"]:
+                tmp = folder / f".{name}.download"
+                try:
+                    log.info("downloading %s from %s", name, url)
+                    with urllib.request.urlopen(url, timeout=60) as resp, open(tmp, "wb") as out:
+                        shutil.copyfileobj(resp, out, 1 << 20)
+                    if member:  # the file is inside a zip archive
+                        with zipfile.ZipFile(tmp) as zf, open(f"{tmp}.x", "wb") as out:
+                            out.write(zf.read(member))
+                        os.replace(f"{tmp}.x", tmp)
+                    if _sha256(tmp) != spec["sha256"]:
+                        raise ValueError("checksum mismatch")
+                    os.replace(tmp, target)
+                    break
+                except Exception as e:  # try the next source
+                    errors.append(f"{url}: {e}")
+                    log.warning("download of %s failed: %s", name, e)
+                finally:
+                    for leftover in (tmp, f"{tmp}.x"):
+                        if os.path.exists(leftover):
+                            os.remove(leftover)
+            if target.exists():
+                break
+            time.sleep(10 * (attempt + 1))
+        if not target.exists():
+            raise RuntimeError(f"could not download {name}: " + "; ".join(errors[-2:]))
 
 
 @dataclass

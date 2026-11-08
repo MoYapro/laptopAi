@@ -18,8 +18,9 @@ from fastapi.staticfiles import StaticFiles
 import config
 from agent import Agent, Hub
 from camera import Camera
+from consolidation import Consolidator
 from db import DB
-from faces import FaceEngine, Gallery, Presence
+from faces import FaceEngine, Gallery, Presence, ensure_face_models
 from llm import Ollama
 from perception import Perception
 from speech import STT, TTS
@@ -36,13 +37,14 @@ def base_prompt() -> str:
 
 db = DB(config.DATA_DIR / "laptopai.db")
 camera = Camera(config.CAMERA_DEVICE)
-llm = Ollama(config.OLLAMA_URL, config.LLM_MODEL, think=config.LLM_THINK)
+llm = Ollama(config.OLLAMA_URL, config.LLM_MODEL, think=config.LLM_THINK, num_ctx=config.CHAT_NUM_CTX)
 stt = STT(config.WHISPER_MODEL, config.MODELS_DIR / "whisper", config.WHISPER_LANGUAGE)
 tts = TTS(config.PIPER_VOICE, config.MODELS_DIR / "piper")
 presence = Presence(Gallery(db), db)
 hub = Hub()
 agent = Agent(db, llm, tts, presence, hub, base_prompt)
-perception = Perception(camera, FaceEngine(), presence, agent)
+perception = Perception(camera, None, presence, agent)  # face engine set in startup_sequence
+consolidator = Consolidator(agent)
 
 
 async def warm_up() -> None:
@@ -62,8 +64,17 @@ async def warm_up() -> None:
             log.exception("warm-up %s failed", name)
 
 
+async def load_face_engine() -> None:
+    try:
+        await asyncio.to_thread(ensure_face_models, config.FACE_MODELS_DIR)
+        perception.engine = await asyncio.to_thread(FaceEngine)
+    except Exception as e:
+        log.exception("face recognition unavailable")
+        await agent.emit("setting", f"face recognition unavailable: {e} (retries on next start)")
+
+
 async def startup_sequence() -> None:
-    await warm_up()
+    await asyncio.gather(warm_up(), load_face_engine())
     perception_task = asyncio.create_task(perception.run())
     await asyncio.sleep(4)  # give face tracking a few frames to settle
     perception.request("the system just started", bypass_cooldown=True)
@@ -74,7 +85,11 @@ async def startup_sequence() -> None:
 async def lifespan(_: FastAPI):
     agent.on_start()
     camera.start()
-    tasks = [asyncio.create_task(startup_sequence()), asyncio.create_task(agent.heartbeat())]
+    tasks = [
+        asyncio.create_task(startup_sequence()),
+        asyncio.create_task(agent.heartbeat()),
+        asyncio.create_task(consolidator.loop()),
+    ]
     yield
     for task in tasks:
         task.cancel()
@@ -114,6 +129,38 @@ async def status() -> dict:
         "quiet": agent.quiet,
         "present": [t.public() for t in presence.present()],
     }
+
+
+@app.get("/memory")
+async def memory_page() -> FileResponse:
+    return FileResponse(config.APP_DIR / "static" / "memory.html")
+
+
+@app.get("/api/memory")
+async def memory() -> dict:
+    """Everything Housemate remembers, organized: people (profile, facts, topics), topics, household facts."""
+    people = []
+    for p in db.people():
+        people.append({
+            "id": p["id"], "name": p["name"], "profile": p["profile"], "last_seen": p["last_seen"],
+            "face_samples": presence.gallery.count(p["id"]),
+            "facts": db.memories(p["id"], 100),
+            "topics": db.topics_for_person(p["id"], 50),
+        })
+    return {
+        "people": people,
+        "topics": db.topics(),
+        "household": db.memories(None, 200),
+        "questions": agent.curiosity.public(),
+        "last_review": float(db.get_setting("consolidated_at", "0")) or None,
+        "review_running": consolidator.running,
+    }
+
+
+@app.post("/api/consolidate")
+async def consolidate() -> dict:
+    """Run the memory review now (takes a while; returns its summary)."""
+    return await consolidator.run("manual")
 
 
 @app.post("/api/transcribe")

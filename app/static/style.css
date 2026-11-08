@@ -27,6 +27,7 @@ header {
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 #model { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .toggles { display: flex; align-items: center; gap: 14px; font-size: 14px; flex-shrink: 0; }
+.navlink { color: var(--accent); text-decoration: none; }
 .toggles label { display: flex; gap: 5px; align-items: center; cursor: pointer; }
 
 .pill { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; background: var(--line); color: var(--muted); }

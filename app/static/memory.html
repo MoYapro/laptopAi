@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Housemate memory</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/memory.css">
+</head>
+<body class="memory">
+<header>
+  <div class="brand"><a href="/" class="back">← chat</a><strong>Memory</strong><span id="review" class="muted"></span></div>
+  <div class="toggles"><button id="run" type="button">Review now</button></div>
+</header>
+
+<main class="mem">
+  <section>
+    <h2>People</h2>
+    <div id="people" class="cards"></div>
+  </section>
+  <section>
+    <h2>Topics</h2>
+    <div id="topics" class="cards"></div>
+  </section>
+  <section>
+    <h2>About this place</h2>
+    <ul id="household" class="facts"></ul>
+    <h2>Wondering about</h2>
+    <ul id="questions" class="facts"></ul>
+  </section>
+</main>
+
+<script src="/static/memory.js"></script>
+</body>
+</html>
