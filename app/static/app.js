@@ -57,6 +57,7 @@ function since(ts) {
 function addMsg(cls, content, label, ts) {
   const div = document.createElement("div");
   div.className = "msg " + cls;
+  if (ts) div.appendChild(stamp(ts));
   if (label) {
     const l = document.createElement("span");
     l.className = "label";
@@ -67,38 +68,28 @@ function addMsg(cls, content, label, ts) {
   body.className = "text";
   body.textContent = content;
   div.appendChild(body);
-  if (ts) div.appendChild(stamp(ts));
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
   return div;
 }
 
 function sourceLabel(source, sender) {
-  if (source === "voice") return "🎙 spoken";
-  if (source === "developer") return "🛠 " + (sender || "developer tool");
-  return "⌨ typed";
+  if (source === "voice") return ["🎙", "spoken"];
+  if (source === "developer") return ["🛠", sender || "developer tool"];
+  return ["⌨", "typed"];
 }
 
 function addUserMsg(text, source, sender, ts) {
-  return addMsg(source === "developer" ? "user dev" : "user", text, sourceLabel(source, sender), ts);
+  const [icon, title] = sourceLabel(source, sender);
+  const div = addMsg(source === "developer" ? "user dev" : "user", text, icon, ts);
+  div.querySelector(".label").title = title;
+  return div;
 }
 
 function renderMessage(m) {
   if (m.role === "user") addUserMsg(m.content, m.source, m.sender, m.ts);
   else if (OWN_LABELS[m.source]) addMsg("own", m.content, OWN_LABELS[m.source], m.ts);
   else addMsg("bot", m.content, null, m.ts);
-}
-
-function fmtTimings(t) {
-  const parts = [];
-  if (t.stt_ms != null) parts.push(`stt ${t.stt_ms} ms`);
-  if (t.queue_ms) parts.push(`waited ${t.queue_ms} ms`);
-  if (t.ttft_ms != null) parts.push(`first token ${t.ttft_ms} ms`);
-  if (t.first_audio_ms != null) parts.push(`first audio ${t.first_audio_ms} ms`);
-  if (t.tok_s != null) parts.push(`${t.tok_s} tok/s`);
-  if (t.prompt_tokens != null) parts.push(`${t.prompt_tokens} prompt tok`);
-  if (t.total_ms != null) parts.push(`total ${t.total_ms} ms`);
-  return parts.join(" · ");
 }
 
 // ---------------------------------------------------------------- timeline
@@ -276,12 +267,6 @@ function connect() {
         enqueueWav(m.wav);
         break;
       case "done":
-        if (botDiv) {
-          const meta = document.createElement("span");
-          meta.className = "meta";
-          meta.textContent = fmtTimings(m.timings);
-          botDiv.appendChild(meta);
-        }
         botDiv = null;
         break;
       case "event":
